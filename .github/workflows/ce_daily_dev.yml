@@ -169,6 +169,7 @@ jobs:
             rm -f ${paddle_whl_name}
           fi
           pip install uv coverage==7.13.0 bce-python-sdk==0.8.74 wrapt matplotlib==3.10.8 pytest parameterized
+          pip install pyarrow==25.0.1
           echo "Paddle Commit"
           python -c "import paddle; print(paddle.version.commit)"
           echo "PaddleFleet Commit"
@@ -298,6 +299,7 @@ jobs:
             rm -f ${paddle_whl_name}
           fi
           pip install uv coverage==7.13.0 bce-python-sdk==0.8.74 wrapt pytest matplotlib==3.10.8
+          pip install pyarrow==25.0.1
           wget -q --no-proxy https://paddle-qa.bj.bcebos.com/paddleformers/yq_linux_amd64 -O /usr/local/bin/yq
           chmod +x /usr/local/bin/yq
           '
@@ -464,6 +466,7 @@ jobs:
           fi
           pip install uv coverage==7.13.0 bce-python-sdk==0.8.74 wrapt matplotlib==3.10.8 pytest parameterized
           pip install librosa==0.11.0
+          pip install pyarrow==25.0.1
           echo "Paddle Commit"
           python -c "import paddle; print(paddle.version.commit)"
           echo "PaddleFleet Commit"
@@ -681,6 +684,7 @@ jobs:
           pip install bce-python-sdk==0.8.74
           pip install coverage==7.13.0
           pip install librosa==0.11.0
+          pip install pyarrow==25.0.1
           echo "Paddle Commit"
           python -c "import paddle; print(paddle.version.commit)"
           echo "PaddleFleet Commit"
@@ -1100,6 +1104,7 @@ jobs:
           pip install bce-python-sdk==0.8.74
           pip install coverage==7.13.0
           pip install librosa==0.11.0
+          pip install pyarrow==25.0.1
           echo "Paddle Commit"
           python -c "import paddle; print(paddle.version.commit)"
           echo "PaddleFleet Commit"

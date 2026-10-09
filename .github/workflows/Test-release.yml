@@ -344,6 +344,7 @@ jobs:
           pip install uv coverage==7.13.0 bce-python-sdk==0.8.74 wrapt pytest matplotlib einops
           pip install dist/${{ needs.build_whl.outputs.root_whl_name }} --extra-index-url=https://www.paddlepaddle.org.cn/packages/nightly/cu129/ --extra-index-url=https://www.paddlepaddle.org.cn/packages/stable/cu129/
           pip install dist/${{ needs.build_whl.outputs.ops_whl_name }} --extra-index-url=https://www.paddlepaddle.org.cn/packages/nightly/cu129/ --extra-index-url=https://www.paddlepaddle.org.cn/packages/stable/cu129/
+          pip install pyarrow==25.0.1
           echo "paddlefleet commit:"
           python -c "import paddlefleet; print(paddlefleet.version.commit)"
           '
@@ -461,6 +462,7 @@ jobs:
           pip install uv coverage==7.13.0 bce-python-sdk==0.8.74 wrapt pytest
           pip install dist/${{ needs.build_whl.outputs.root_whl_name }} --extra-index-url=https://www.paddlepaddle.org.cn/packages/nightly/cu129/ --extra-index-url=https://www.paddlepaddle.org.cn/packages/stable/cu129/
           pip install dist/${{ needs.build_whl.outputs.ops_whl_name }} --extra-index-url=https://www.paddlepaddle.org.cn/packages/nightly/cu129/ --extra-index-url=https://www.paddlepaddle.org.cn/packages/stable/cu129/
+          pip install pyarrow==25.0.1
           echo "paddlefleet commit:"
           python -c "import paddlefleet; print(paddlefleet.version.commit)"
           echo "paddle commit:"
@@ -613,6 +615,7 @@ jobs:
           sed -i "s/from gpt_provider import GPTModelProvider/from paddlefleet.transformers.gpt_provider import GPTModelProvider/g" examples/experiments/paddlefleet/glm45_provider.py
           sed -i "s/from gpt_provider import GPTModelProvider/from paddlefleet.transformers.gpt_provider import GPTModelProvider/g" examples/experiments/paddlefleet/qwen_provider.py
           pip install librosa==0.11.0
+          pip install pyarrow==25.0.1
           echo "paddlefleet commit:"
           python -c "import paddlefleet; print(paddlefleet.version.commit)"
           echo "paddle commit:"
@@ -812,6 +815,7 @@ jobs:
           git config --global --add safe.directory /workspace/PaddleFleet
           # git log -1
           pip install librosa==0.11.0
+          pip install pyarrow==25.0.1
           echo "paddlefleet commit:"
           python -c "import paddlefleet; print(paddlefleet.version.commit)"
           echo "paddle commit:"
@@ -1256,6 +1260,7 @@ jobs:
           git config pull.rebase false
           # git log -1
           pip install librosa==0.11.0
+          pip install pyarrow==25.0.1
           echo "paddlefleet commit:"
           python -c "import paddlefleet; print(paddlefleet.version.commit)"
           echo "paddle commit:"
@@ -1741,6 +1746,7 @@ jobs:
             --extra-index-url=https://www.paddlepaddle.org.cn/packages/stable/cu129/
           python -m pip install --group test-formers -i https://pypi.org/simple
           python -m pip install "torch>=2.1,<2.11" -i https://pypi.org/simple
+          python -m pip install pyarrow==25.0.1 -i https://pypi.org/simple
           python -c "import paddlefleet; print(paddlefleet.version.commit)"
           DOCKER_EOF
       - name: Test

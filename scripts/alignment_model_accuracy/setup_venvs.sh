@@ -24,6 +24,7 @@ readonly TORCH_VERSION="2.12.0+cu130"
 readonly TORCH_INDEX_URL="https://download.pytorch.org/whl/cu130"
 readonly TE_VERSION="2.17.1"
 readonly TRANSFORMERS_VERSION="4.57.1"
+readonly PYARROW_VERSION="25.0.1"
 readonly PADDLE_INDEX_URL="https://www.paddlepaddle.org.cn/packages/stable/cu130/"
 readonly NIGHTLY_WHL_BASE="https://paddle-whl.bj.bcebos.com/nightly/cu130"
 # readonly PADDLE_VERSION="xx"
@@ -119,6 +120,9 @@ setup_torch_venv() {
         --no-binary transformer-engine-torch \
         --reinstall-package transformer-engine-torch \
         "transformer_engine_torch==${TE_VERSION}"
+
+    # Pinned last so it wins over the pyarrow pulled in transitively by datasets.
+    uv pip install --python "${torch_py}" "pyarrow==${PYARROW_VERSION}"
 }
 
 setup_paddle_venv() {
@@ -164,6 +168,10 @@ setup_paddle_venv() {
         "${PADDLEFLEET_OPS_WHEEL}"
     # uv pip install --python "${paddle_py}" -v --no-build-isolation \
     #     -e ./PaddleFleet/packages/paddlefleet_ops
+
+    # Pinned last so it wins over the pyarrow pulled in transitively by
+    # paddlefleet -> datasets.
+    uv pip install --python "${paddle_py}" "pyarrow==${PYARROW_VERSION}"
 }
 
 print_installed_versions() {
