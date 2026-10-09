@@ -88,7 +88,7 @@ jobs:
           pr_number=$(echo $response | jq -r '.[0].url' | awk -F'/' '{print $NF}')
           pr_last_commit=$(echo $response | jq -r '.[0].head.sha')
           mkdir fleet-312 && cd fleet-312
-          wget https://only-internal-network-support.bj.bcebos.com/PaddleFleet/PR/${pr_number}/${pr_last_commit}/${BRANCH}/paddlefleet.tar.gz
+          wget --no-proxy https://only-internal-network-support.bj.bcebos.com/PaddleFleet/PR/${pr_number}/${pr_last_commit}/${BRANCH}/paddlefleet.tar.gz
           tar -xf paddlefleet.tar.gz --strip-components=1
           git config --global --add safe.directory .
           cd dist
@@ -295,7 +295,6 @@ jobs:
       matrix:
         python_version: ["3.12"]
         cuda:
-          - {CUDA_VERSION: CUDA13.0, bos_CUDA: cu130, IMAGE_TAG: cuda130-dev-arm-py312}
           - {CUDA_VERSION: CUDA13.2, bos_CUDA: cu132, IMAGE_TAG: cuda132-dev-arm-py312}
     env:
       TASK: PaddleFleet-nightly-arm-${{ matrix.cuda.CUDA_VERSION }}
@@ -462,8 +461,6 @@ jobs:
           - {label: paddle-release, bos_CUDA: cu129, python_version: "3.12", artifact_name: "whl-name-paddle-release-cu129-py3.12-linux_x86_64", name_key: "paddlefleet_ops-paddle-release-cu129-py312-linux_x86_64.whl.name"}
           - {label: paddle-release, bos_CUDA: cu130, python_version: "3.12", artifact_name: "whl-name-paddle-release-cu130-py3.12-linux_x86_64", name_key: "paddlefleet_ops-paddle-release-cu130-py312-linux_x86_64.whl.name"}
           - {label: paddle-release, bos_CUDA: cu132, python_version: "3.12", artifact_name: "whl-name-paddle-release-cu132-py3.12-linux_x86_64", name_key: "paddlefleet_ops-paddle-release-cu132-py312-linux_x86_64.whl.name"}
-          # arm: linux_aarch64 wheels published to only-internal-network-support/PaddleFleet/${BRANCH}/${COMMIT_ID}/${cuda}
-          - {label: arm, bos_CUDA: cu130, python_version: "3.12", artifact_name: "whl-name-arm-cu130-py3.12-linux_aarch64", name_key: "paddlefleet_ops-arm-cu130-linux_aarch64.whl.name"}
     steps:
       - name: Download wheel name artifact
         if: github.ref_type != 'tag' && matrix.flavor.label != 'arm'
