@@ -173,8 +173,7 @@ def _reject_unsupported_decoder_branches(config):
     silently later, so each is turned into an explicit ``NotImplementedError``.
     Current production configs trigger none of these, so behavior is unchanged.
     """
-    if getattr(config, "mtp_num_layers", None):
-        raise NotImplementedError("HyperBody decoder has no MTP layers.")
+
     if getattr(config, "separate_mtp_headloss", False):
         raise NotImplementedError(
             "HyperBody decoder does not use separate_mtp_headloss."

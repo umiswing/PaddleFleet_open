@@ -55,11 +55,14 @@ from paddle.distributed.fleet.meta_parallel import (
     LayerDesc,
     LayerSpec,
     PipelineLayer,
+    SharedLayerDesc,
     build_spec_layer,
 )
 
 from paddlefleet.models.common.language_loss.language_loss import LanguageLoss
 from paddlefleet.models.gpt.gpt_layer_specs import (
+    _get_effective_mtp_layers,
+    get_gpt_mtp_layers_spec,
     get_gpt_spec,
 )
 from paddlefleet.models.hyperbody import (
@@ -694,6 +697,8 @@ class HyperBodySublayersSpec:
     mhc_expand: LayerSpec = None
     decoder_layers: list[LayerSpec] = field(default_factory=list)
     mhc_contract: LayerSpec = None
+    # MTP layer spec(s), structure only (weight sharing + forward wired later).
+    mtp: list[LayerSpec] = None
     layer_norm: LayerSpec = None
     lm_head: LayerSpec = None
 
@@ -751,6 +756,39 @@ class HyperBodyUnifiedModel(PretrainedModel, PipelineLayer):
             for i, x in enumerate(self._sequential_layers)
         }
 
+    def _iter_transformer_layers(self):
+        from paddlefleet.transformer.multi_token_prediction import (
+            MultiTokenPredictionLayer,
+        )
+        from paddlefleet.transformer.transformer_layer import TransformerLayer
+
+        if getattr(self, "_num_virtual_pipeline_stages", 1) > 1:
+            layers = (layer for chunk in self._model_chunks for layer in chunk)
+        else:
+            layers = self.run_function
+        for layer in layers:
+            if isinstance(layer, TransformerLayer):
+                yield layer
+            elif isinstance(layer, MultiTokenPredictionLayer):
+                # Mirror GPTModel: MTP's fp8 state lives on its inner body.
+                yield layer.transformer_layer
+
+    def fp8_quant_weight(self, batch_mode=False, quant_transpose=True):
+        for layer in self._iter_transformer_layers():
+            layer.fp8_quant_weight(
+                batch_mode=batch_mode, quant_transpose=quant_transpose
+            )
+
+    def clear_fp8_quant_weight(self):
+        for layer in self._iter_transformer_layers():
+            layer.clear_fp8_quant_weight()
+
+    def use_fp8(self):
+        for layer in self._iter_transformer_layers():
+            if layer.use_fp8():
+                return True
+        return False
+
     def get_layer_desc_list(self, spec: HyperBodySublayersSpec):
         layers = []
         # --- encoder region (name_prefix="encoder") ---
@@ -774,16 +812,59 @@ class HyperBodyUnifiedModel(PretrainedModel, PipelineLayer):
             self.add_sequential_layer(
                 layers, LayerDesc(spec.mhc_expand), "model.mhc_expand"
             )
+        n_dec = len(spec.decoder_layers)
         for i, dec_layer in enumerate(spec.decoder_layers):
-            self.add_sequential_layer(
-                layers, LayerDesc(dec_layer), f"model.layers.{i}"
-            )
+            # With mtp_shared_last_layer on, the LAST backbone layer is the pivot
+            # of the "mtp_reuse_transformer" shared key; each MTP layer's
+            # transformer_layer aliases its weights (see the MTP loop below).
+            # Mirrors the standard GPTModel. PP=1 => pivot and aliases co-locate.
+            if (
+                i == n_dec - 1
+                and spec.mtp
+                and getattr(self.config, "mtp_shared_last_layer", False)
+            ):
+                desc = SharedLayerDesc(
+                    "mtp_reuse_transformer",
+                    dec_layer,
+                    shared_weight_attr="transformer_layer_weights",
+                )
+            else:
+                desc = LayerDesc(dec_layer)
+            self.add_sequential_layer(layers, desc, f"model.layers.{i}")
         # hyper-connections contract (after trunk, before final norm).
         if spec.mhc_contract is not None:
             self.add_sequential_layer(
                 layers, LayerDesc(spec.mhc_contract), "model.mhc_contract"
             )
         self.add_sequential_layer(layers, LayerDesc(spec.layer_norm), "model")
+        # MTP layers (structure wiring; MTP forward/loss still deferred). Mirror
+        # the standard GPTModel: placed after the final norm, indexed continuing
+        # the main decoder layers (first MTP layer is model.layers.{n_dec}, so it
+        # lines up with the extra csa_compress_ratios entries). Weight sharing is
+        # honored here: mtp_shared_last_layer aliases each MTP body against the
+        # backbone pivot ("mtp_reuse_transformer"); mtp_shared_weights aliases the
+        # all-depths key ("mtp_shared_all"); otherwise each MTP layer owns weights.
+        if spec.mtp:
+            for j, mtp_layer in enumerate(spec.mtp):
+                if getattr(self.config, "mtp_shared_last_layer", False):
+                    desc = SharedLayerDesc(
+                        "mtp_reuse_transformer",
+                        mtp_layer,
+                        shared_submodule_weight_only=True,
+                        shared_weight_attr="transformer_layer_weights",
+                    )
+                elif getattr(self.config, "mtp_shared_weights", False):
+                    desc = SharedLayerDesc(
+                        "mtp_shared_all",
+                        mtp_layer,
+                        shared_submodule_weight_only=True,
+                        shared_weight_attr="all_weights",
+                    )
+                else:
+                    desc = LayerDesc(mtp_layer)
+                self.add_sequential_layer(
+                    layers, desc, f"model.layers.{n_dec + j}"
+                )
         self.add_sequential_layer(
             layers, LayerDesc(spec.lm_head), "model.lm_head"
         )
@@ -991,7 +1072,7 @@ def _build_encoder_view(config: HyperBodyConfig, decoder_hidden: int):
         moe_shared_expert_overlap=config.moe_shared_expert_overlap,
         moe_router_load_balancing_type=config.moe_router_load_balancing_type,
         moe_token_dispatcher_type=config.moe_token_dispatcher_type,
-        apply_rope_fusion=config.apply_rope_fusion,
+        apply_rope_fusion=False,
         # Mirror the decoder's routed-scaling learnability: when the flat config
         # turns it on, the decoder's moe_router allocates a learnable
         # ``routed_scaling_factor_param``. Not forwarding it here would leave the
@@ -1047,6 +1128,18 @@ def build_hyperbody_unified_model(
     # production configs trigger none of these => behavior unchanged.
     _reject_unsupported_decoder_branches(decoder_view)
 
+    decoder_layers_spec = get_hyperbody_decoder_layer_specs(decoder_view)
+    # MTP: build the MTP layer spec(s) exactly like the standard gpt_builder so
+    # dec_sub.mtp gets populated and the MTP layers show up in the unified
+    # PipelineLayer. Per-depth weight sharing (mtp_shared_last_layer /
+    # mtp_shared_weights) is applied at layer assembly in get_layer_desc_list via
+    # SharedLayerDesc; only the MTP forward/loss is still deferred.
+    mtp_layers_spec = None
+    if _get_effective_mtp_layers(decoder_view) > 0:
+        mtp_layers_spec = get_gpt_mtp_layers_spec(
+            decoder_view, decoder_layers_spec
+        )
+
     gpt_spec = get_gpt_spec(
         config=decoder_view,
         head_empty_layers_spec=[],
@@ -1054,9 +1147,9 @@ def build_hyperbody_unified_model(
         # shared GPT spec (via get_gpt_layer_local_spec) and supports the full
         # ernie5_v2 / dsv4_hybrid attention family; it additionally enforces a
         # per-layer 0/1 list moe_layer_freq (rejecting int i%N semantics).
-        transformer_layers_spec=get_hyperbody_decoder_layer_specs(decoder_view),
+        transformer_layers_spec=decoder_layers_spec,
         tail_empty_layers_spec=[],
-        mtp_layers_spec=None,
+        mtp_layers_spec=mtp_layers_spec,
         vocab_size=decoder_view.vocab_size,
         tie_word_embeddings=decoder_view.tie_word_embeddings,
         max_sequence_length=decoder_view.max_sequence_length,
@@ -1087,6 +1180,7 @@ def build_hyperbody_unified_model(
         mhc_expand=dec_sub.mhc_expand,
         decoder_layers=dec_sub.transformer_layers,
         mhc_contract=dec_sub.mhc_contract,
+        mtp=dec_sub.mtp,
         layer_norm=dec_sub.layer_norm,
         lm_head=dec_sub.lm_head,
     )
