@@ -2301,6 +2301,9 @@ class EMAStateAssembler:
             self.model, GPTModel
         )
         n_routed_experts = self.model.config.n_routed_experts
+        expert_model_parallel_size = (
+            self.model.config.expert_model_parallel_size
+        )
 
         hcg = paddle.distributed.fleet.get_hybrid_communicate_group()
         try:
@@ -2314,16 +2317,21 @@ class EMAStateAssembler:
                 "[EMAStateAssembler] Only support when pp_group is not None."
             )
 
-        if n_routed_experts == 0:
+        if n_routed_experts == 0 or expert_model_parallel_size <= 1:
             tp_group = hcg.get_model_parallel_group()
             sharding_group = hcg.get_sharding_parallel_group()
             sharding_rank = hcg.get_sharding_parallel_rank()
             self.sharding_group = sharding_group
             self.h_group = tp_group
             self.v_group = pp_group
+            if tp_group.nranks == 1 or pp_group.nranks == 1:
+                self.h_group = None
+                self.v_group = None
             self.num_splits = sharding_group.nranks
             self.shard_idx = sharding_rank
             self.expert_id_offset = -1
+            if n_routed_experts > 0 and expert_model_parallel_size <= 1:
+                self.expert_id_offset = 0
         else:
             moe_group = hcg.get_expert_parallel_group()
             moe_sharding_group = hcg.get_moe_sharding_parallel_group()

@@ -698,7 +698,7 @@ class HyperBodySublayersSpec:
     lm_head: LayerSpec = None
 
 
-class HyperBodyUnifiedModel(PipelineLayer):
+class HyperBodyUnifiedModel(PretrainedModel, PipelineLayer):
     """One PipelineLayer: encoder frontend/trunk/bridge + decoder emb/trunk/head.
 
     Mirrors ``GPTModel``'s pipeline mechanics (``get_layer_desc_list`` +
@@ -706,6 +706,8 @@ class HyperBodyUnifiedModel(PipelineLayer):
     layer order. Encoder-region layers use the ``encoder`` name prefix, decoder
     region uses ``model`` (matching ``GPTModel``), so weight keys do not clash.
     """
+
+    config_class = HyperBodyConfig
 
     def __init__(self, sublayers_spec, **kwargs) -> None:
         self.config = kwargs["config"]
@@ -725,7 +727,9 @@ class HyperBodyUnifiedModel(PipelineLayer):
         topology = (
             None if pp == 1 else fleet.get_hybrid_communicate_group().topology()
         )
-        super().__init__(
+
+        PipelineLayer.__init__(
+            self,
             layers=self.layers,
             topology=topology,
             num_virtual_pipeline_stages=(
