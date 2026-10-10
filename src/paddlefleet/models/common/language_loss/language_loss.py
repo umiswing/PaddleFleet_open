@@ -224,6 +224,12 @@ class LanguageLoss(FleetLayer):
     # Class-level tracker for MTP loss, read by trainer for logging.
     mtp_loss_tracker: dict[str, float] = {}
 
+    # Class-level accumulator for the global token-weighted loss (logging only),
+    # filled per micro-batch by _reduce_loss_by_tokens and reduced by
+    # consume_token_avg_loss, whose only caller is
+    # ``Trainer._apply_global_token_avg_loss``.
+    token_avg_tracker: dict = {}
+
     # Class-level stash for cu_seqlens_q under use_erndata=True.
     # Populated on every rank by the dataloader (ernie5
     # dist_data_loader.py — right after the three broadcast_data_obj calls),
@@ -274,6 +280,77 @@ class LanguageLoss(FleetLayer):
             config.loss_subbatch_sequence_length
         )
         self.use_subbatch = self.loss_subbatch_sequence_length > 0
+
+    def _reduce_loss_by_tokens(self, loss_sum, local_valid):
+        """Normalize this rank's (loss_sum, valid_tokens) into a scalar loss.
+
+        Always returns ``loss_sum / local_valid`` for backprop. When
+        ``calculate_per_token_loss`` is on, a *training* forward additionally
+        stashes the raw ``(loss_sum, valid_tokens)`` in a class-level tracker so
+        the trainer can log the global token-weighted loss. No collective
+        communication here.
+
+        Scope -- ``forward_impl`` routes through this helper on the fused
+        linear+CE path and the default non-fused path. Two other terminal
+        branches normalize on their own and so never accumulate: the
+        ``gpt_model_use_experimental_version`` line-wise reduction (per-sample
+        mean, then averaged over samples) and the ``use_accuracy_compatible``
+        EP-replicated fp64 reduction. Neither is ΣΣS/ΣΣn, so folding them in
+        would change what the logged number means. Under those configurations
+        ``calculate_per_token_loss`` therefore leaves the tracker empty,
+        ``consume_token_avg_loss`` returns ``None`` and the trainer keeps
+        logging the micro-average -- the absence of a ``loss_microavg`` key is
+        how to tell that apart from the feature being active. The branch is
+        chosen by config, identically on every rank, so there is no desync
+        risk. (The all-ignored early returns skip the helper as well, but a
+        micro-batch with zero valid tokens would contribute (0, 0) anyway.)
+
+        Eval/predict forwards deliberately do not accumulate: the logged value
+        covers one training logging interval and only the training loss is
+        unified (``evaluate()`` keeps reporting its micro-average). Grad mode is
+        the discriminator -- both eval forward paths (``prediction_step``,
+        ``prediction_pipeline_step``) run under ``paddle.no_grad()`` -- so even a
+        subclass that reimplements the eval loop (ERNIE's
+        ``EvalPPLMixin.evaluate``) stays correct with no trainer coordination.
+
+        ``self.training`` cannot serve as that discriminator: the criterion is
+        stored in ``PipelineLayer._loss_fn`` (a plain ``list``), never a
+        registered sublayer, so ``model.eval()`` never reaches it and the flag
+        is always ``True``.
+        """
+        enabled = getattr(self.config, "calculate_per_token_loss", False)
+        if not enabled:
+            return loss_sum / local_valid
+
+        # Accumulate this rank's device scalars; the trainer produces the
+        # logging value. Grad mode keeps eval/predict out of the interval.
+        if paddle.is_grad_enabled():
+            _tr = LanguageLoss.token_avg_tracker
+            _tr["S"] = _tr.get("S", 0.0) + loss_sum.detach()
+            _tr["n"] = _tr.get("n", 0.0) + local_valid.detach()
+        # Backprop: each rank normalizes by its local valid tokens.
+        return loss_sum / paddle.clip(local_valid, min=1.0)
+
+    @classmethod
+    def consume_token_avg_loss(cls):
+        """all_reduce(SUM) the accumulated (ΣS, Σn) and return the global
+        token-weighted loss ΣΣS/ΣΣn, clearing the tracker. None if empty.
+
+        COLLECTIVE: two ``all_reduce`` calls on the default group, so every rank
+        must reach this the same number of times -- gate only on rank-invariant
+        state (not on e.g. ``evaluation_loop``'s per-rank ``all_losses``) and
+        decide what to log after it returns. Ranks that accumulated nothing
+        (non-last pipeline stages) still take part, contributing (0, 0).
+        """
+        _tr = cls.token_avg_tracker
+        _S = paddle.to_tensor([float(_tr.get("S", 0.0))], dtype="float64")
+        _n = paddle.to_tensor([float(_tr.get("n", 0.0))], dtype="float64")
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(_S, dist.ReduceOp.SUM)
+            dist.all_reduce(_n, dist.ReduceOp.SUM)
+        _tr.clear()
+        nv = float(_n.item())
+        return round(float(_S.item()) / nv, 8) if nv > 0 else None
 
     def forward_impl(self, logits: Tensor | tuple, labels: Tensor) -> Tensor:
         # Fused linear + cross-entropy path: `logits` is actually a
@@ -339,7 +416,7 @@ class LanguageLoss(FleetLayer):
             loss = paddle.sum(
                 loss.cast(paddle.float32).reshape([-1]) * lossmask
             )
-            loss = loss / lossmask.sum()
+            loss = self._reduce_loss_by_tokens(loss, lossmask.sum())
             return loss
 
         seq_len = logits.shape[1]
@@ -517,7 +594,7 @@ class LanguageLoss(FleetLayer):
                     loss = paddle.sum(
                         loss.cast(paddle.float32).reshape([-1]) * lossmask
                     )
-                    loss = loss / lossmask.sum()
+                    loss = self._reduce_loss_by_tokens(loss, lossmask.sum())
 
         if _use_accuracy_compatible_kernel():
             # 定位锚点 2：mask + 归一化后的标量 loss，与锚点 1 配合可切开

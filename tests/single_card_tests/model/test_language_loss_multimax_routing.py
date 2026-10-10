@@ -70,9 +70,25 @@ class _StubLanguageLoss:
             fused_linear_ce_loss_chunk=fused_chunk,
             gpt_model_use_experimental_version=False,
             cp_balance_mode="default",
+            # Routing is what's under test, not the token-averaged loss display:
+            # off, so the final reduction is plain loss_sum / valid_tokens.
+            calculate_per_token_loss=False,
         )
         self.enable_parallel_cross_entropy = parallel_ce
         self.ignored_index = ignored_index
+
+    def _reduce_loss_by_tokens(self, loss_sum, local_valid):
+        """``forward_impl`` normalizes through this; delegate to the real
+        implementation so the production reduction stays under test.
+
+        Imported lazily for the same reason as in ``setUpClass``: the sonicmoe
+        gate must be in effect before ``language_loss`` is imported.
+        """
+        from paddlefleet.models.common.language_loss.language_loss import (
+            LanguageLoss,
+        )
+
+        return LanguageLoss._reduce_loss_by_tokens(self, loss_sum, local_valid)
 
 
 class TestLanguageLossMultimaxRouting(unittest.TestCase):

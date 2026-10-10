@@ -3974,6 +3974,46 @@ class Trainer:
         else:
             return loss
 
+    def _apply_global_token_avg_loss(self, logs):
+        """When ``calculate_per_token_loss`` is enabled, replace the logged loss
+        with the global token-weighted loss (ΣΣS/ΣΣn) reduced across ranks by
+        ``LanguageLoss``, keeping the micro-average as ``loss_microavg``.
+        Logging only — backprop is unchanged.
+
+        Called from ``log()`` so every Trainer subclass (incl. ernie5) gets it
+        for free. ``consume_token_avg_loss`` clears the tracker, so a second
+        ``log()`` in the same step is a no-op.
+
+        The ``"loss" in logs`` gate keeps this to the training log
+        (``_maybe_log_save_evaluate`` always sets it; the eval / checkpoint-save
+        / train-end ``log()`` sites never do) and is rank-invariant, as
+        ``consume_token_avg_loss``'s all_reduce requires.
+
+        Training loss only, on purpose: ``evaluate()`` keeps reporting
+        ``{prefix}_loss`` as the micro-average. The eval number belongs to
+        whoever implements the eval loop (ernie5 already computes ΣΣS/ΣΣn as
+        ``eval_loss`` and derives ``eval_ppl`` from it), and
+        ``evaluation_loop``'s ``{prefix}_loss`` is per-rank, so it cannot gate
+        a collective. The criterion correspondingly only accumulates on
+        training forwards.
+        """
+        _cfg = getattr(self.model, "config", None)
+        if not getattr(_cfg, "calculate_per_token_loss", False):
+            return
+        if "loss" not in logs:
+            return
+        try:
+            from paddlefleet.models.common.language_loss.language_loss import (
+                LanguageLoss as _LL,
+            )
+
+            _v = _LL.consume_token_avg_loss()
+            if _v is not None:
+                logs["loss_microavg"] = logs["loss"]
+                logs["loss"] = _v
+        except Exception as _e:  # noqa: BLE001
+            logger.warning(f"[tokenavg] skip override: {_e}")
+
     def _maybe_log_save_evaluate(
         self, tr_loss, model, epoch, ignore_keys_for_eval, **kwargs
     ):
@@ -7085,6 +7125,10 @@ class Trainer:
             logs (`Dict[str, float]`):
                 The values to log.
         """
+
+        # loss 统一口径（calculate_per_token_loss=True）：在唯一汇聚点把 logs["loss"]
+        # 换成全局 token 加权 ΣΣS/ΣΣn，原微平均存 loss_microavg。仅打印，不动反传。
+        self._apply_global_token_avg_loss(logs)
 
         try:
             from paddle.distributed.fleet.utils.timer_helper import (

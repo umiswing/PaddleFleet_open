@@ -77,6 +77,10 @@ def _make_loss_stub(
         add_mtp_loss=add_mtp_loss,
         mtp_loss_scaling_factor=mtp_scaling,
         cp_balance_mode="contiguous_allgather",
+        # The flag gates under test are the normalization branches, not the
+        # token-averaged loss display: off, so the non-accuracy-compatible
+        # branch reduces to plain loss_sum / valid_tokens.
+        calculate_per_token_loss=False,
     )
     stub = types.SimpleNamespace(
         config=config,
@@ -92,6 +96,10 @@ def _make_loss_stub(
     )
     stub._forward = types.MethodType(language_loss.LanguageLoss._forward, stub)
     stub.forward = types.MethodType(language_loss.LanguageLoss.forward, stub)
+    # forward_impl's final reduction goes through this.
+    stub._reduce_loss_by_tokens = types.MethodType(
+        language_loss.LanguageLoss._reduce_loss_by_tokens, stub
+    )
     return stub
 
 
