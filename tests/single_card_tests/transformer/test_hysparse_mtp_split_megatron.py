@@ -35,7 +35,7 @@ K = 2
 B, L, H = 1, 12, 4
 
 
-def _make_config(use_erndata):
+def _make_config(use_erndata, mtp_attention_flexible=False):
     return SimpleNamespace(
         num_nextn_predict_layers=K,
         mtp_load_weight_only=False,
@@ -46,31 +46,38 @@ def _make_config(use_erndata):
         experimental_dataflow=False,
         separate_mtp_input=False,
         use_erndata=use_erndata,
+        mtp_attention_flexible=mtp_attention_flexible,
     )
 
 
-def _make_fake_layer(use_erndata):
-    fake = SimpleNamespace(config=_make_config(use_erndata))
+def _make_fake_layer(use_erndata, mtp_attention_flexible=False):
+    fake = SimpleNamespace(
+        config=_make_config(use_erndata, mtp_attention_flexible)
+    )
     fake._mtp_enabled = lambda is_mtp: HySparseTransformerLayer._mtp_enabled(
         fake, is_mtp
     )
     return fake
 
 
-def _make_dict_args(seq_len):
+def _make_dict_args(seq_len, mask_seq_len=None):
     """dict_args as seen by the main decoder layer.
 
     hidden_states is the MTP (K+1)-way batch-dim stack in both styles;
     position_ids / mask carry seq_len entries (L for megatron, L+K for ernie5).
+    Under mtp_attention_flexible the main mask already arrives at length L
+    while position_ids are still L+K, so ``mask_seq_len`` may differ.
     input_ids stays None to keep the test free of fleet/CP process groups.
     """
+    if mask_seq_len is None:
+        mask_seq_len = seq_len
     return {
         "hidden_states": paddle.randn([(K + 1) * B, L, H]),
         "position_ids": paddle.arange(seq_len)
         .reshape([1, seq_len])
         .tile([B, 1]),
         "attn_mask_startend_row_indices": paddle.full(
-            [B, 1, seq_len, 1], seq_len, dtype="int32"
+            [B, 1, mask_seq_len, 1], mask_seq_len, dtype="int32"
         ),
         "input_ids": None,
     }
@@ -143,6 +150,37 @@ class TestErnie5TrimsStillApply:
             L + K,
             1,
         ]
+
+
+class TestMtpAttentionFlexibleSkipsMaskTrim:
+    """mtp_attention_flexible: position_ids trimmed, mask already at length L.
+
+    Under mtp_attention_flexible the main
+    attn_mask_startend_row_indices already arrives at main-decoder length L
+    (mask_seq_len = max_seq_len - K) while input_ids / position_ids still
+    carry L+K. Only the mask K-trim must be skipped -- trimming an
+    already-length-L mask yields L-K and crashes DSv4 doc-mask packing
+    (startend_row_indices [B,1,L-K,1] vs hidden [B,1,L,1]).
+    """
+
+    def test_position_ids_trimmed_mask_kept_full_length(self):
+        fake = _make_fake_layer(False, mtp_attention_flexible=True)
+        dict_args = _make_dict_args(L + K, mask_seq_len=L)
+        ctx = HySparseTransformerLayer._mtp_split(fake, dict_args, is_mtp=False)
+        assert ctx is not None
+        assert dict_args["position_ids"].shape == [B, L]
+        assert ctx["mtp_ids"].shape == [B, K]
+        assert dict_args["attn_mask_startend_row_indices"].shape == [B, 1, L, 1]
+        assert ctx["attn_mask_mtp"] is None
+
+    def test_restore_reassembles_position_ids_mask_stays_L(self):
+        fake = _make_fake_layer(False, mtp_attention_flexible=True)
+        dict_args = _make_dict_args(L + K, mask_seq_len=L)
+        ctx = HySparseTransformerLayer._mtp_split(fake, dict_args, is_mtp=False)
+        output = dict_args["hidden_states"]
+        HySparseTransformerLayer._mtp_restore(fake, dict_args, output, ctx)
+        assert dict_args["position_ids"].shape == [B, L + K]
+        assert dict_args["attn_mask_startend_row_indices"].shape == [B, 1, L, 1]
 
 
 class TestMtpDisabledIsNoop:

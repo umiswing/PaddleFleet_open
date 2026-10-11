@@ -917,9 +917,20 @@ class TransformerLayer(nn.Layer):
                         :, -self.config.num_nextn_predict_layers :
                     ].contiguous()
                     dict_args["input_ids"] = decoder_input_ids
+            # mtp_attention_flexible: like the
+            # megatron path, the collator/online reader emit the MAIN mask at
+            # length L already (mask_seq_len = max_seq_len - K) and ship the
+            # per-depth MTP masks separately in ``mtp_startend_row_indices_all``.
+            # input_ids / position_ids are still L+K here (unlike megatron), so
+            # only the mask trim must be skipped -- trimming an already-length-L
+            # mask by K yields L-K and crashes DSv4 doc-mask packing
+            # (startend_row_indices [B,1,L-K,1] vs hidden [B,1,L,1]).
+            _mtp_mask_already_main_len = _mtp_is_megatron or getattr(
+                self.config, "mtp_attention_flexible", False
+            )
             if (
                 not self.config.experimental_dataflow
-                and not _mtp_is_megatron
+                and not _mtp_mask_already_main_len
                 and "attn_mask_startend_row_indices" in dict_args.keys()
             ):
                 # Old dataflow (ernie5 L+K path): main mask contains mtp parts
@@ -942,10 +953,10 @@ class TransformerLayer(nn.Layer):
                     attn_mask_startend_row_indices_decoder
                 )
             else:
-                # New dataflow (experimental_dataflow=True): main mask is already main-seq only,
-                # mtp masks are in mtp_startend_row_indices_all and will be used by MTP layer directly.
-                # Megatron style: mask is already length-L; MTP layer will derive per-depth mask
-                # from cu_seqlens_q, so leave main mask untouched here.
+                # experimental_dataflow / megatron / mtp_attention_flexible:
+                # main mask is already main-seq (length L); the per-depth MTP
+                # masks live in mtp_startend_row_indices_all and are consumed by
+                # the MTP layer directly, so leave the main mask untouched here.
                 attn_mask_startend_row_indices_mtp = None
 
         if self.config.block_attention_residuals and "blocks" not in dict_args:
@@ -2651,10 +2662,17 @@ class HySparseTransformerLayer(TransformerLayer):
                 ctx["mtp_input_ids"] = full_input_ids[:, -n:].contiguous()
 
         # attn_mask_startend_row_indices: split along seq dim (old dataflow,
-        # ernie5 L+K path only -- under megatron the mask is already length L)
+        # ernie5 L+K path only). Under megatron OR mtp_attention_flexible the
+        # main mask already arrives at length L (MTP masks ship separately in
+        # mtp_startend_row_indices_all), so the K-trim must be skipped --
+        # trimming an already-length-L mask yields L-K and crashes DSv4
+        # doc-mask packing.
+        _mtp_mask_already_main_len = _mtp_is_megatron or getattr(
+            self.config, "mtp_attention_flexible", False
+        )
         if (
             not self.config.experimental_dataflow
-            and not _mtp_is_megatron
+            and not _mtp_mask_already_main_len
             and "attn_mask_startend_row_indices" in dict_args
             and dict_args["attn_mask_startend_row_indices"] is not None
         ):
