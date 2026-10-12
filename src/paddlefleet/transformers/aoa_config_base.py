@@ -64,6 +64,9 @@ class MoEAOAConfigParams:
 
     index_n_heads: int = 0
 
+    # Only magic send builds the MTP layers' own ``mtp_embed`` table.
+    enable_mtp_magic_send: bool = False
+
     # Extra statements to add
     extra_statements: List[str] = field(default_factory=list)
 
@@ -102,11 +105,11 @@ class MoEAOAConfigGenerator:
 
         Subclasses can override this to add custom parameter extraction.
         """
-        # Get num_experts from config
-        if hasattr(config, "n_routed_experts"):
-            num_experts = config.n_routed_experts
-        else:
-            num_experts = getattr(config, "num_experts", 0)
+        # Providers may expose the routed expert count under either spelling;
+        # an explicit value wins and a missing/None primary value falls back.
+        num_experts = getattr(config, "n_routed_experts", None)
+        if num_experts is None:
+            num_experts = getattr(config, "num_experts", None) or 0
 
         return MoEAOAConfigParams(
             num_hidden_layers=config.num_hidden_layers,
@@ -133,6 +136,9 @@ class MoEAOAConfigGenerator:
             has_shared_experts=cls._has_shared_experts(config),
             model_prefix=cls._get_model_prefix(config),
             index_n_heads=getattr(config, "index_n_heads", 0),
+            enable_mtp_magic_send=getattr(
+                config, "enable_mtp_magic_send", False
+            ),
         )
 
     @classmethod
@@ -146,6 +152,18 @@ class MoEAOAConfigGenerator:
     def _has_shared_experts(cls, config: Any) -> bool:
         """Check if model has shared experts. Override for models without shared experts."""
         return True
+
+    @staticmethod
+    def _magic_send_mtp_embed_names(params: MoEAOAConfigParams) -> List[str]:
+        """``mtp_embed`` weights that magic send builds on each MTP layer."""
+        if not params.enable_mtp_magic_send:
+            return []
+        # MTP layers follow the decoder layers; empty placeholder layers are
+        # named separately and take no ``layers.<i>`` slot.
+        return [
+            f"{params.model_prefix}layers.{params.num_hidden_layers + i}.mtp_embed.weight"
+            for i in range(params.num_nextn_predict_layers)
+        ]
 
     @classmethod
     def _build_aoa_config(
@@ -188,6 +206,10 @@ class MoEAOAConfigGenerator:
         # Embeddings
         statements.append(
             f"model.embed_tokens.weight -> {params.model_prefix}embedding.embed_tokens.weight"
+        )
+        statements.extend(
+            f"model.embed_tokens.weight -> {name}"
+            for name in cls._magic_send_mtp_embed_names(params)
         )
 
         # lm_head
@@ -655,6 +677,10 @@ class MoEAOAConfigGenerator:
             statements.append(
                 f"{params.model_prefix}lm_head.weight -> lm_head.weight"
             )
+
+        statements.extend(
+            f"{name} -> _" for name in cls._magic_send_mtp_embed_names(params)
+        )
 
         return statements
 
