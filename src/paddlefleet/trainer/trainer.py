@@ -32,6 +32,7 @@ import time
 import types
 from collections import OrderedDict
 from collections.abc import Mapping
+from functools import cache
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -301,6 +302,25 @@ MODEL_NAME = "model"
 OPTIMIZER_NAME = "optimizer"
 DIST_CKPT_PATH = "dist_ckpt"
 DIST_MODEL_PATH = "dist_model"
+
+
+@cache
+def _supports_load_num_workers():
+    """Whether the installed paddle's ``dist.load_state_dict`` accepts ``num_workers``.
+
+    Only paddle versions that support reading tensor payloads with multiple threads
+    expose this argument, so it has to be forwarded conditionally. A
+    ``**kwargs``-style signature (e.g. a profiling wrapper installed around the real
+    function) is treated as supported, since the argument is forwarded to the wrapped
+    callable.
+    """
+    try:
+        params = inspect.signature(dist.load_state_dict).parameters
+    except (TypeError, ValueError):
+        return False
+    if "num_workers" in params:
+        return True
+    return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 class Trainer:
@@ -1531,6 +1551,27 @@ class Trainer:
             )
             return metadata_files[0]
 
+        # `flex_ckpt_load_num_workers` > 1 asks paddle.load to read the tensor payloads
+        # of each .distcp file with several threads. The argument is only forwarded when
+        # the installed paddle accepts it, so older paddle versions keep the serial read.
+        _load_workers = int(
+            getattr(self.args, "flex_ckpt_load_num_workers", 1) or 1
+        )
+        _load_kwargs = {}
+        if _load_workers > 1:
+            if _supports_load_num_workers():
+                _load_kwargs["num_workers"] = _load_workers
+                logger.info(
+                    "[FlexCheckpoint] loading checkpoint with paddle.load "
+                    f"num_workers={_load_workers}"
+                )
+            else:
+                logger.warning(
+                    "[FlexCheckpoint] the installed paddle's dist.load_state_dict does "
+                    "not accept num_workers, ignoring "
+                    f"flex_ckpt_load_num_workers={_load_workers}."
+                )
+
         with _sprof_span("sharded_state_dict"):
             model_sharded_state_dict = self.model.sharded_state_dict()
         master_weights_path = os.path.join(
@@ -1636,6 +1677,7 @@ class Trainer:
                 comm_method=flex_ckpt_comm_method,
                 worker_groups=worker_groups,
                 **load_transform_kwargs,
+                **_load_kwargs,
             )
             if hasattr(self.model, "_synchronize_shared_weights"):
                 self.model._synchronize_shared_weights()
@@ -1689,7 +1731,10 @@ class Trainer:
                             "performing EMA reshard..."
                         )
                         self._ema_reshard_result = self._load_ema_with_reshard(
-                            ema_state_path, flex_ckpt_comm_method, worker_groups
+                            ema_state_path,
+                            flex_ckpt_comm_method,
+                            worker_groups,
+                            _load_kwargs,
                         )
                         logger.info(
                             "[EMA Reshard] EMA reshard completed, results stored for subprocess"
@@ -1744,6 +1789,7 @@ class Trainer:
                     offload=self.args.load_via_cpu,
                     comm_method=flex_ckpt_comm_method,
                     worker_groups=worker_groups,
+                    **_load_kwargs,
                 )
 
             if not self.args.ignore_load_lr_and_optim:
@@ -1771,6 +1817,7 @@ class Trainer:
                         offload=self.args.load_via_cpu,
                         comm_method=flex_ckpt_comm_method,
                         worker_groups=worker_groups,
+                        **_load_kwargs,
                     )
                 self._load_scheduler(resume_from_checkpoint)
 
@@ -1824,6 +1871,7 @@ class Trainer:
                     offload=self.args.load_via_cpu,
                     comm_method=flex_ckpt_comm_method,
                     worker_groups=worker_groups,
+                    **_load_kwargs,
                 )
             else:
                 ema_states_path = os.path.join(
@@ -1891,6 +1939,7 @@ class Trainer:
                     offload=self.args.load_via_cpu,
                     comm_method=flex_ckpt_comm_method,
                     worker_groups=worker_groups,
+                    **_load_kwargs,
                 )
 
         if enable_bf16_opt:
@@ -2161,7 +2210,7 @@ class Trainer:
         return ema_target
 
     def _load_ema_with_reshard(
-        self, ema_state_path, comm_method, worker_groups
+        self, ema_state_path, comm_method, worker_groups, load_kwargs=None
     ):
         """Use FlexCheckpoint to reshard EMA state, return shared memory metas for subprocess."""
         ema_target = self._build_ema_target(allocate=True)
@@ -2176,6 +2225,7 @@ class Trainer:
             offload=self.args.load_via_cpu,
             comm_method=comm_method,
             worker_groups=worker_groups,
+            **(load_kwargs or {}),
         )
         logger.info("[EMA Reshard] dist.load_state_dict completed")
 
@@ -2204,7 +2254,131 @@ class Trainer:
         )
         return ema_shared_result
 
+    def _ema_resumable_locally_sharded_fast(
+        self, metadata_path, ema_state_path, ema_target, use_dist
+    ):
+        """Return True if every rank can load EMA from its own `{rank}_0.distcp`, None if undecided.
+
+        It never unpickles storage_metadata and, unlike Paddle's check_resumable_locally_fast (which
+        covers unsharded checkpoints only), it accepts sharded tensors as well, so that check is not
+        tried separately: each live shard must be one of `state_dict_metadata[key]`, and the
+        rank's distcp header must hold `key` with that shard's stored shape (a distcp holds one shard
+        per key, 1-D if flattened). The header records no offset, so when several shards of a key
+        share the stored shape (e.g. TP/EP splits of equal size) the file is attributed to this rank's
+        shard only if the parallel strategy is unchanged since save (model_meta.json). Only a positive
+        verdict is returned; anything else is left to the stock checks. Issues exactly one
+        all_gather_object whenever it gets that far.
+        """
+        try:
+            from paddle.distributed.flex_checkpoint.dcp.distcp_reader import (
+                scan_tensor_shapes,
+            )
+            from paddle.distributed.flex_checkpoint.dcp.metadata_reader import (
+                load_state_dict_metadata,
+            )
+            from paddle.distributed.flex_checkpoint.dcp.utils import (
+                extract_tensor_metadata,
+            )
+        except ImportError:
+            return None
+
+        # Same shared file on every rank, so returning here is uniform and happens
+        # before any collective.
+        state_dict_metadata = load_state_dict_metadata(
+            metadata_path, allow_full_load=False
+        )
+        if state_dict_metadata is None:
+            return None
+
+        def _shard_id(meta):
+            flattened_range = (
+                None
+                if meta.flattened_range is None
+                else tuple(meta.flattened_range)
+            )
+            return (
+                tuple(meta.global_offset),
+                tuple(meta.local_shape),
+                bool(meta.is_flattened),
+                flattened_range,
+            )
+
+        def _stored_shape(meta):
+            if meta.is_flattened:
+                begin, end = meta.flattened_range
+                return (end - begin,)
+            return tuple(meta.local_shape)
+
+        rank = paddle.distributed.get_rank() if use_dist else 0
+        ckpt_file = os.path.join(ema_state_path, f"{rank}_0.distcp")
+        local_ok, num_ambiguous, reason = True, 0, None
+        try:
+            file_shapes = scan_tensor_shapes(ckpt_file)
+            for key, value in ema_target.items():
+                _, meta = extract_tensor_metadata(value)
+                if meta is None:
+                    continue
+                shards = state_dict_metadata.get(key)
+                if shards is None:
+                    local_ok, reason = (
+                        False,
+                        f"'{key}' is not in the checkpoint",
+                    )
+                    break
+                if not isinstance(shards, (list, tuple)):
+                    shards = [shards]
+                if _shard_id(meta) not in {_shard_id(s) for s in shards}:
+                    local_ok = False
+                    reason = f"shard {_shard_id(meta)} of '{key}' is not in the checkpoint"
+                    break
+                want = _stored_shape(meta)
+                if file_shapes.get(key) != want:
+                    local_ok = False
+                    reason = f"'{key}' in file has shape {file_shapes.get(key)}, wanted {want}"
+                    break
+                if sum(_stored_shape(s) == want for s in shards) > 1:
+                    num_ambiguous += 1
+        except Exception as e:
+            local_ok, reason = False, f"{type(e).__name__}: {e}"
+
+        same_strategy = True
+        if local_ok and num_ambiguous > 0:
+            try:
+                checkpoint_path = os.path.dirname(
+                    os.path.normpath(ema_state_path)
+                )
+                same_strategy, err_msg = DistInfoCollectorValidator(
+                    self.args, getattr(self, "hcg", None)
+                ).check_same_strategy(checkpoint_path)
+                if not same_strategy:
+                    reason = f"parallel strategy changed ({err_msg})"
+            except Exception as e:
+                same_strategy = False
+                reason = (
+                    f"cannot verify parallel strategy: {type(e).__name__}: {e}"
+                )
+
+        if not (local_ok and same_strategy):
+            logger.info(
+                f"[EMA Reshard][fast_check] rank {rank} cannot confirm local load: {reason}"
+            )
+
+        results = [(local_ok, same_strategy, num_ambiguous)]
+        if use_dist:
+            results = []
+            paddle.distributed.all_gather_object(
+                results, (local_ok, same_strategy, num_ambiguous)
+            )
+        num_ok = sum(ok and same for ok, same, _ in results)
+        logger.info(
+            f"[EMA Reshard][fast_check] {num_ok}/{len(results)} ranks confirmed local load "
+            f"from distcp headers (this rank: {len(ema_target)} tensors, {num_ambiguous} "
+            f"matched by shape+strategy) without loading storage_metadata"
+        )
+        return True if num_ok == len(results) else None
+
     def ema_weight_reshard(self, ema_state_path):
+        """Return True (need reshard) if any rank's EMA shards are not all found in its own `{rank}_0.distcp`."""
         from paddle.distributed.flex_checkpoint.dcp.load_state_dict import (
             get_checkpoint_files,
         )
@@ -2216,12 +2390,20 @@ class Trainer:
         )
 
         metadata_files, _ = get_checkpoint_files(ema_state_path)
-        metadata_manager = MetadataManager()
-        metadata_manager.set_metadata_list(
-            [paddle.load(os.path.join(ema_state_path, metadata_files[0]))]
-        )
+        metadata_path = os.path.join(ema_state_path, metadata_files[0])
         ema_target = self._build_ema_target(allocate=False)
         use_dist = paddle.distributed.get_world_size() > 1
+
+        if self._ema_resumable_locally_sharded_fast(
+            metadata_path, ema_state_path, ema_target, use_dist
+        ):
+            return False
+
+        logger.info(
+            "[EMA Reshard] fast check undecided, falling back to full metadata check"
+        )
+        metadata_manager = MetadataManager()
+        metadata_manager.set_metadata_list([paddle.load(metadata_path)])
         return not check_resumable_locally(
             ema_state_path, ema_target, metadata_manager, use_dist, None
         )

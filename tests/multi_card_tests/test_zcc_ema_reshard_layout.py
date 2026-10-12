@@ -262,9 +262,13 @@ def _flex_harness():
     harness._load_ema_with_reshard = Trainer._load_ema_with_reshard.__get__(
         harness
     )
-    # _load_flex_checkpoint gates on ema_weight_reshard; both it and the reshard
-    # build their target via _build_ema_target -- bind all three.
+    # _load_flex_checkpoint gates on ema_weight_reshard (which first tries the
+    # sharded fast check); both it and the reshard build their target via
+    # _build_ema_target -- bind all of them.
     harness.ema_weight_reshard = Trainer.ema_weight_reshard.__get__(harness)
+    harness._ema_resumable_locally_sharded_fast = (
+        Trainer._ema_resumable_locally_sharded_fast.__get__(harness)
+    )
     harness._build_ema_target = Trainer._build_ema_target.__get__(harness)
     return harness
 
