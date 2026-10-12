@@ -95,6 +95,12 @@ def _make_loss_stub(
         language_loss.LanguageLoss.forward_impl, stub
     )
     stub._forward = types.MethodType(language_loss.LanguageLoss._forward, stub)
+    for name in ("_global_labels_for_depth", "_labels_for_depth"):
+        setattr(
+            stub,
+            name,
+            types.MethodType(getattr(language_loss.LanguageLoss, name), stub),
+        )
     stub.forward = types.MethodType(language_loss.LanguageLoss.forward, stub)
     # forward_impl's final reduction goes through this.
     stub._reduce_loss_by_tokens = types.MethodType(

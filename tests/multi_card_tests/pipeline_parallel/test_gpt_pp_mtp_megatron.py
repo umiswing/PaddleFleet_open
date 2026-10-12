@@ -25,8 +25,9 @@ Megatron data contract (differs from the ernie5 template!):
   * a single int32 ``cu_seqlens_q`` = ``[0, d1, ..., L]`` carries the packed-doc
     boundaries (batch-global semantics);
   * ``GPTEmbedding`` (stage 0) rolls embeddings per-doc via ``cu_seqlens_q``,
-    the MTP layer derives per-depth attn masks from it, and ``LanguageLoss``
-    (last stage) rolls labels per-doc using the stashed ``cu_seqlens_q``.
+    the MTP layer reuses the adapter-supplied backbone flashmask, and
+    ``LanguageLoss`` (last stage) rolls labels per-doc using the stashed
+    ``cu_seqlens_q``.
 
 If the last-stage stash were missing, ``LanguageLoss.forward`` would raise
 ``RuntimeError("... requires cu_seqlens_q to be stashed ...")`` instead of
@@ -47,6 +48,9 @@ import paddlefleet
 from paddlefleet.gpt_builders import gpt_builder
 from paddlefleet.models.gpt import GPTConfig
 from paddlefleet.training.initialize import initialize_fleet
+from paddlefleet.transformer.multi_token_prediction import (
+    build_startend_row_indices_from_cu_seqlens,
+)
 
 PP_DEGREE = 2
 MTP_DEGREE = 1
@@ -198,12 +202,19 @@ def run_pp(seed, batch_size, seq_len, vocab_size, cu_seqlens_list):
     )
     # cu_seqlens_q: int32 1D packed-doc boundaries, batch-global. Must end at L.
     cu_seqlens_q = paddle.to_tensor(cu_seqlens_list, dtype="int32")
+    # Stand in for the erndata adapter, which owns the flashmask:
+    # GPTEmbedding rejects a use_erndata batch without it.
+    attn_mask_startend_row_indices = build_startend_row_indices_from_cu_seqlens(
+        cu_seqlens_q, micro_batch_size, seq_len=seq_len
+    )
 
     inputs = (
         {
             "input_ids": [input_ids] * num_acc,
             "position_ids": [position_ids] * num_acc,
             "cu_seqlens_q": [cu_seqlens_q] * num_acc,
+            "attn_mask_startend_row_indices": [attn_mask_startend_row_indices]
+            * num_acc,
         },
         [labels] * num_acc,
     )

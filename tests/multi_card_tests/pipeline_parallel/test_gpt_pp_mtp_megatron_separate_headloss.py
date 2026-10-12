@@ -30,7 +30,8 @@ vpp=1 with pp=4 (4 GPUs, no interleave). seg_method includes
 MultiTokenPredictionLayer so the MTP layer carries a segmentation weight,
 matching the production entry point.
 
-Megatron data contract: length-L tensors + a single int32 cu_seqlens_q. A
+Megatron data contract: length-L tensors + a single int32 cu_seqlens_q +
+the adapter-supplied flashmask. A
 finite loss + clean exit proves the last-stage stash reached both the MTP and
 main losses (otherwise ``_megatron_label_for_depth`` raises RuntimeError).
 """
@@ -48,6 +49,9 @@ import paddlefleet
 from paddlefleet.gpt_builders import gpt_builder
 from paddlefleet.models.gpt import GPTConfig
 from paddlefleet.training.initialize import initialize_fleet
+from paddlefleet.transformer.multi_token_prediction import (
+    build_startend_row_indices_from_cu_seqlens,
+)
 
 PP_DEGREE = 4
 VPP_DEGREE = 1
@@ -176,6 +180,11 @@ def run_pp(seed, batch_size, seq_len, vocab_size, cu_seqlens_list):
         .tile([micro_batch_size, 1])
     )
     cu_seqlens_q = paddle.to_tensor(cu_seqlens_list, dtype="int32")
+    # Stand in for the erndata adapter, which owns the flashmask:
+    # GPTEmbedding rejects a use_erndata batch without it.
+    attn_mask_startend_row_indices = build_startend_row_indices_from_cu_seqlens(
+        cu_seqlens_q, micro_batch_size, seq_len=seq_len
+    )
 
     # separate_mtp_headloss runs MTPLanguageLoss as an in-pipeline layer that
     # reads labels from the pipeline dict, so labels must ride inputs[0] (via
@@ -186,6 +195,8 @@ def run_pp(seed, batch_size, seq_len, vocab_size, cu_seqlens_list):
             "input_ids": [input_ids] * num_acc,
             "position_ids": [position_ids] * num_acc,
             "cu_seqlens_q": [cu_seqlens_q] * num_acc,
+            "attn_mask_startend_row_indices": [attn_mask_startend_row_indices]
+            * num_acc,
             "labels": [labels] * num_acc,
         },
         [labels] * num_acc,
