@@ -115,6 +115,55 @@ def _dense_scalar_use_long_query(use_long_query):
     return bool(use_long_query)
 
 
+_HB_DECODER_PASSTHROUGH_KEYS = (
+    "mtp_startend_row_indices_all",
+    "mtp_hidden_inputs_mask_all",
+)
+
+_HB_PASSTHROUGH_LOGGED = False
+
+
+def _export_decoder_passthrough(out, dict_args):
+    """Frontend: stash the passthrough fields under ``_hb_dec_*``.
+
+    Always writes the key (``None`` when absent) so the dict's key set does not
+    vary across micro-steps.
+    """
+    for key in _HB_DECODER_PASSTHROUGH_KEYS:
+        out[f"_hb_dec_{key}"] = dict_args.get(key, None)
+    return out
+
+
+def _restore_decoder_passthrough(decoder_args, dict_args):
+    """Bridge: rename the ``_hb_dec_*`` fields back onto the decoder dict.
+
+    Only non-``None`` values are written: an absent key and a ``None`` value are
+    equivalent for every consumer (``dict_args.get``), and leaving ``None`` out
+    keeps the decoder dict free of None-valued entries.
+    """
+    global _HB_PASSTHROUGH_LOGGED
+    for key in _HB_DECODER_PASSTHROUGH_KEYS:
+        value = dict_args.get(f"_hb_dec_{key}", None)
+        if value is not None:
+            decoder_args[key] = value
+    if not _HB_PASSTHROUGH_LOGGED:
+        _HB_PASSTHROUGH_LOGGED = True
+        import logging as _logging
+
+        _logging.getLogger(__name__).info(
+            "[HyperBody bridge] decoder passthrough: %s",
+            {
+                k: (
+                    "absent"
+                    if decoder_args.get(k, None) is None
+                    else tuple(decoder_args[k].shape)
+                )
+                for k in _HB_DECODER_PASSTHROUGH_KEYS
+            },
+        )
+    return decoder_args
+
+
 # ======================================================================= #
 # NEW wrapper layer 1: encoder frontend (pipeline-hostile logic isolated)  #
 # ======================================================================= #
@@ -401,7 +450,7 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
             "attn_mask_startend_row_indices", None
         )
         out["_hb_dec_position_ids"] = dict_args.get("position_ids", None)
-        return out
+        return _export_decoder_passthrough(out, dict_args)
 
     def _forward_text_only(
         self, dict_args, build_dense_mask, prefix_lm_pad_len
@@ -427,7 +476,7 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
             "attn_mask_startend_row_indices", None
         )
         out["_hb_dec_position_ids"] = dict_args.get("position_ids", None)
-        return out
+        return _export_decoder_passthrough(out, dict_args)
 
     def _forward_dense(
         self,
@@ -625,7 +674,29 @@ class HyperBodyEncoderBridge(FleetLayer):
         # Text-only short path: encoder produced a discardable dummy; emit
         # image_embeds=None so the decoder embedding's _merge_multimodal no-ops.
         if dict_args.get("_hb_text_only", False):
-            return {
+            return _restore_decoder_passthrough(
+                {
+                    "input_ids": dict_args["_hb_dec_input_ids"],
+                    "position_ids": dict_args.get("_hb_dec_position_ids", None),
+                    "attention_mask": None,
+                    "attn_mask_startend_row_indices": dict_args[
+                        "_hb_dec_attn_mask_startend_row_indices"
+                    ],
+                    "decoder_input": None,
+                    "image_embeds": None,
+                    "video_embeds": None,
+                    "labels": dict_args["_hb_dec_labels"],
+                },
+                dict_args,
+            )
+        layout = dict_args.get("_hb_packed", None)
+        if layout is not None:
+            image_embeds = self._forward_packed(dict_args, layout)
+        else:
+            image_embeds = self._forward_dense(dict_args)
+
+        return _restore_decoder_passthrough(
+            {
                 "input_ids": dict_args["_hb_dec_input_ids"],
                 "position_ids": dict_args.get("_hb_dec_position_ids", None),
                 "attention_mask": None,
@@ -633,28 +704,12 @@ class HyperBodyEncoderBridge(FleetLayer):
                     "_hb_dec_attn_mask_startend_row_indices"
                 ],
                 "decoder_input": None,
-                "image_embeds": None,
+                "image_embeds": image_embeds,
                 "video_embeds": None,
                 "labels": dict_args["_hb_dec_labels"],
-            }
-        layout = dict_args.get("_hb_packed", None)
-        if layout is not None:
-            image_embeds = self._forward_packed(dict_args, layout)
-        else:
-            image_embeds = self._forward_dense(dict_args)
-
-        return {
-            "input_ids": dict_args["_hb_dec_input_ids"],
-            "position_ids": dict_args.get("_hb_dec_position_ids", None),
-            "attention_mask": None,
-            "attn_mask_startend_row_indices": dict_args[
-                "_hb_dec_attn_mask_startend_row_indices"
-            ],
-            "decoder_input": None,
-            "image_embeds": image_embeds,
-            "video_embeds": None,
-            "labels": dict_args["_hb_dec_labels"],
-        }
+            },
+            dict_args,
+        )
 
     def _forward_dense(self, dict_args):
         h = dict_args["hidden_states"]
