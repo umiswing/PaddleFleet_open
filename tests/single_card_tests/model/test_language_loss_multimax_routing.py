@@ -72,7 +72,7 @@ class _StubLanguageLoss:
             cp_balance_mode="default",
             # Routing is what's under test, not the token-averaged loss display:
             # off, so the final reduction is plain loss_sum / valid_tokens.
-            calculate_per_token_loss=False,
+            log_global_token_avg_loss=False,
         )
         self.enable_parallel_cross_entropy = parallel_ce
         self.ignored_index = ignored_index

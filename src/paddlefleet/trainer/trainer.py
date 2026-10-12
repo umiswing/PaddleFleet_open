@@ -4157,8 +4157,8 @@ class Trainer:
             return loss
 
     def _apply_global_token_avg_loss(self, logs):
-        """When ``calculate_per_token_loss`` is enabled, replace the logged loss
-        with the global token-weighted loss (ΣΣS/ΣΣn) reduced across ranks by
+        """When ``log_global_token_avg_loss`` is enabled, replace the logged loss
+        with the global token-averaged loss (ΣΣS/ΣΣn) reduced across ranks by
         ``LanguageLoss``, keeping the micro-average as ``loss_microavg``.
         Logging only — backprop is unchanged.
 
@@ -4180,7 +4180,7 @@ class Trainer:
         training forwards.
         """
         _cfg = getattr(self.model, "config", None)
-        if not getattr(_cfg, "calculate_per_token_loss", False):
+        if not getattr(_cfg, "log_global_token_avg_loss", False):
             return
         if "loss" not in logs:
             return
@@ -7308,8 +7308,8 @@ class Trainer:
                 The values to log.
         """
 
-        # loss 统一口径（calculate_per_token_loss=True）：在唯一汇聚点把 logs["loss"]
-        # 换成全局 token 加权 ΣΣS/ΣΣn，原微平均存 loss_microavg。仅打印，不动反传。
+        # loss 统一口径（log_global_token_avg_loss=True）：在唯一汇聚点把 logs["loss"]
+        # 换成全局 token 平均 ΣΣS/ΣΣn，原微平均存 loss_microavg。仅打印，不动反传。
         self._apply_global_token_avg_loss(logs)
 
         try:

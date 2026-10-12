@@ -384,6 +384,12 @@ class LlmMetaConfig:
             -1,
             "Sequence length larger than loss_subbatch_sequence_length will be divided into multiple subbatches during loss computation (-1 means disable subbatch).",
         ),
+        (
+            "log_global_token_avg_loss",
+            bool,
+            False,
+            "Log the global token-averaged loss (sum of per-token losses over sum of valid tokens, reduced across all ranks) instead of the micro-batch average. Logging only: backprop is unchanged.",
+        ),
     ]
 
     moe_attributes = [

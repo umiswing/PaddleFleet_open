@@ -80,7 +80,7 @@ def _make_loss_stub(
         # The flag gates under test are the normalization branches, not the
         # token-averaged loss display: off, so the non-accuracy-compatible
         # branch reduces to plain loss_sum / valid_tokens.
-        calculate_per_token_loss=False,
+        log_global_token_avg_loss=False,
     )
     stub = types.SimpleNamespace(
         config=config,

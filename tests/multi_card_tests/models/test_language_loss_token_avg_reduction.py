@@ -14,7 +14,7 @@
 
 """Real 2-GPU coverage for ``consume_token_avg_loss``'s cross-rank reduction.
 
-With ``calculate_per_token_loss`` on, every training forward stashes this rank's
+With ``log_global_token_avg_loss`` on, every training forward stashes this rank's
 raw ``(loss_sum, valid_tokens)`` in a class-level tracker; the trainer then calls
 ``consume_token_avg_loss``, which ``all_reduce(SUM)``s both terms and returns the
 global token-weighted loss ΣΣS/ΣΣn (matching Megatron ``lm_loss``). Those two
@@ -61,7 +61,7 @@ def _build_config():
         attention_dropout=0.0,
         loss_subbatch_sequence_length=0,
         gpt_model_use_experimental_version=False,
-        calculate_per_token_loss=True,
+        log_global_token_avg_loss=True,
         init_method=functools.partial(paddle.nn.init.xavier_uniform_, gain=1.0),
         output_layer_init_method=functools.partial(
             paddle.nn.init.xavier_uniform_, gain=1.0

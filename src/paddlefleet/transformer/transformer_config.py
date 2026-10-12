@@ -618,6 +618,13 @@ class TransformerConfig(ModelParallelConfig):
     """Whether cross entropy loss is calculated over the actual number of non-padded tokens in the
     global batch, versus the default behavior of assuming all tokens are non-padded."""
 
+    log_global_token_avg_loss: bool = False
+    """Whether the *logged* loss is the global token-averaged loss (sum of per-token losses over
+    sum of valid tokens, reduced across all ranks) instead of the micro-batch average. Logging
+    only: backprop is unchanged. Set it from the training YAML (``LlmMetaConfig.loss_attributes``
+    routes it onto the model config); the micro-batch average stays available as
+    ``loss_microavg``."""
+
     fp32_residual_connection: bool = False
     """If true, move residual connections to fp32."""
 

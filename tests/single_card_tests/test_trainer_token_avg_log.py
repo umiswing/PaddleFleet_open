@@ -15,7 +15,7 @@
 """Trainer-side half of the global token-averaged loss display (loss 口径统一).
 
 ``Trainer._apply_global_token_avg_loss`` is the only consumer of the criterion's
-tracker: with ``calculate_per_token_loss`` on it swaps ``logs["loss"]`` for the
+tracker: with ``log_global_token_avg_loss`` on it swaps ``logs["loss"]`` for the
 global token-weighted ΣΣS/ΣΣn and keeps the micro-average as
 ``logs["loss_microavg"]``. The criterion side is covered by
 ``transformer/test_language_loss_token_avg.py``; this file pins the gates and the
@@ -52,7 +52,7 @@ def _fake_trainer(enabled):
     """Minimal ``self``: the method only reads ``self.model.config``."""
     return types.SimpleNamespace(
         model=types.SimpleNamespace(
-            config=types.SimpleNamespace(calculate_per_token_loss=enabled)
+            config=types.SimpleNamespace(log_global_token_avg_loss=enabled)
         )
     )
 
@@ -180,7 +180,7 @@ def test_log_applies_the_override_at_its_single_call_site():
             callback_handler=types.SimpleNamespace(on_log=_on_log),
         )
         fake_self.model = types.SimpleNamespace(
-            config=types.SimpleNamespace(calculate_per_token_loss=True)
+            config=types.SimpleNamespace(log_global_token_avg_loss=True)
         )
         fake_self._apply_global_token_avg_loss = types.MethodType(
             trainer.Trainer._apply_global_token_avg_loss, fake_self

@@ -14,7 +14,7 @@
 
 """Unit coverage for the global token-averaged loss display (loss 口径统一).
 
-``calculate_per_token_loss`` gates a logging-only convention: every training
+``log_global_token_avg_loss`` gates a logging-only convention: every training
 forward stashes its raw ``(loss_sum, valid_tokens)`` in a class-level tracker
 and the trainer consumes it to log the global token-weighted loss ΣΣS/ΣΣn
 (matching Megatron lm_loss). The backprop term stays ``loss_sum / local_valid``.
@@ -41,7 +41,7 @@ from paddlefleet.models.common.language_loss.language_loss import LanguageLoss
 
 class _Cfg:
     def __init__(self, enabled):
-        self.calculate_per_token_loss = enabled
+        self.log_global_token_avg_loss = enabled
 
 
 class _Self:

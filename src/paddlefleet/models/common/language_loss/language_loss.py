@@ -288,11 +288,11 @@ class LanguageLoss(FleetLayer):
     def _reduce_loss_by_tokens(self, loss_sum, local_valid):
         """Normalize this rank's (loss_sum, valid_tokens) into a scalar loss.
 
-        Always returns ``loss_sum / local_valid`` for backprop. When
-        ``calculate_per_token_loss`` is on, a *training* forward additionally
-        stashes the raw ``(loss_sum, valid_tokens)`` in a class-level tracker so
-        the trainer can log the global token-weighted loss. No collective
-        communication here.
+        Always returns ``loss_sum / local_valid`` for backprop, whether or not the
+        switch is on. When ``log_global_token_avg_loss`` is on, a *training*
+        forward additionally stashes the raw ``(loss_sum, valid_tokens)`` in a
+        class-level tracker so the trainer can log the global token-averaged
+        loss. No collective communication here.
 
         Scope -- ``forward_impl`` routes through this helper on the fused
         linear+CE path and the default non-fused path. Two other terminal
@@ -301,7 +301,7 @@ class LanguageLoss(FleetLayer):
         mean, then averaged over samples) and the ``use_accuracy_compatible``
         EP-replicated fp64 reduction. Neither is ΣΣS/ΣΣn, so folding them in
         would change what the logged number means. Under those configurations
-        ``calculate_per_token_loss`` therefore leaves the tracker empty,
+        ``log_global_token_avg_loss`` therefore leaves the tracker empty,
         ``consume_token_avg_loss`` returns ``None`` and the trainer keeps
         logging the micro-average -- the absence of a ``loss_microavg`` key is
         how to tell that apart from the feature being active. The branch is
@@ -322,17 +322,19 @@ class LanguageLoss(FleetLayer):
         registered sublayer, so ``model.eval()`` never reaches it and the flag
         is always ``True``.
         """
-        enabled = getattr(self.config, "calculate_per_token_loss", False)
-        if not enabled:
-            return loss_sum / local_valid
-
         # Accumulate this rank's device scalars; the trainer produces the
         # logging value. Grad mode keeps eval/predict out of the interval.
-        if paddle.is_grad_enabled():
+        if (
+            getattr(self.config, "log_global_token_avg_loss", False)
+            and paddle.is_grad_enabled()
+        ):
             _tr = LanguageLoss.token_avg_tracker
             _tr["S"] = _tr.get("S", 0.0) + loss_sum.detach()
             _tr["n"] = _tr.get("n", 0.0) + local_valid.detach()
-        # Backprop: each rank normalizes by its local valid tokens.
+        # Backprop: each rank normalizes by its local valid tokens. The clip is
+        # defensive -- both call sites return early when every label is ignored,
+        # so ``local_valid >= 1`` -- and it is deliberately NOT gated on the
+        # switch above, which is logging-only.
         return loss_sum / paddle.clip(local_valid, min=1.0)
 
     @classmethod
