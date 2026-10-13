@@ -274,6 +274,9 @@ tests:
   - test_case: [tests/multi_card_tests/test_zcc_ema_reshard_layout.py]
     products:
       - num_gpus: 4
+  - test_case: [tests/multi_card_tests/test_fsdp_zcc.py]
+    products:
+      - num_gpus: 2
   # default fallback for remaining multi_card_tests
   - test_case: [tests/multi_card_tests/pipeline_parallel/*.py]
     products:

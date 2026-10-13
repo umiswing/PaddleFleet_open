@@ -1677,6 +1677,11 @@ def init_optimizer(optimizer, model_sharded_state_dict, state_dict_metadata):
     Args:
         optimizer: The optimizer instance to be initialized.
     """
+    _fsdp_ctx = _get_fsdp_context()
+    if _fsdp_ctx is not None and hasattr(_fsdp_ctx, "init_optimizer_state"):
+        _fsdp_ctx.init_optimizer_state(optimizer)
+        return
+
     optimizer_state_names = [
         ".moment1_0",
         ".moment2_0",
@@ -2115,6 +2120,18 @@ def get_lr_ratio_fn(optimizer):
             return candidate
         opt = getattr(opt, "_inner_opt", None) or getattr(opt, "_optim", None)
     return None
+
+
+def _get_fsdp_context():
+    """Return the active FSDP context, or None when FSDP is unavailable/inactive."""
+    try:
+        from paddle.distributed.fsdp._fsdp_context import get_fsdp_context
+    except ImportError as e:
+        logger.debug(
+            f"FSDP context unavailable, fallback to non-FSDP path: {e}"
+        )
+        return None
+    return get_fsdp_context()
 
 
 def _is_muon_sharding_optimizer(optimizer):

@@ -4090,6 +4090,21 @@ class TrainingArguments:
         )
 
     @property
+    def zcc_fsdp_mode(self):
+        """Zero cost checkpoint under FSDP, only supported with flex_checkpoint."""
+        if self.enable_auto_parallel:
+            return False
+        return (
+            ShardingOption.FSDP in self.sharding
+            and self.save_checkpoint_format == "flex_checkpoint"
+        )
+
+    @property
+    def zcc_supported_sharding(self):
+        """Sharding strategies supported by zero cost checkpoint: stage1, or FSDP with flex_checkpoint."""
+        return self.should_save_sharding_stage1_model or self.zcc_fsdp_mode
+
+    @property
     def should_load_sharding_stage1_model(self):
         if self.enable_auto_parallel:
             return False

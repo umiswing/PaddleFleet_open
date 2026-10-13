@@ -92,7 +92,7 @@ from ...utils.env import (
 from ...utils.fault_tolerance import FC_DUMP_ERROR, PC_DUMP_ERROR
 from ...utils.log import logger
 from ...utils.pdc_sdk import FLASH_DEVICE
-from ..trainer_utils import _is_muon_sharding_optimizer
+from ..trainer_utils import _get_fsdp_context, _is_muon_sharding_optimizer
 from . import reshard as reshard_util
 from .reshard import (
     SHARDING_STRATEGY_V1,
@@ -227,6 +227,43 @@ def sharded_state_dict_compatibility(func, *, return_sharded_state_dict=False):
     return wrapper
 
 
+def _restore_master_weights_from_unified(
+    unified_name_mapping, unified_master_weights
+):
+    """Map unified-named master weights back to their original static names.
+
+    Args:
+        unified_name_mapping: {orig: unified}; under FSDP, {orig: [(unified, begin, end), ...]}.
+        unified_master_weights: {unified: tensor}, master weight entries only.
+
+    Returns:
+        {orig: tensor}. Under FSDP, flat slices of a fused bucket are joined by offset into a 1D tensor.
+    """
+    inv_mapping = {}
+    for k, v in unified_name_mapping.items():
+        if isinstance(v, list):
+            for unified_key, begin, end in v:
+                inv_mapping[unified_key] = (k, begin, end)
+        else:
+            inv_mapping[v] = (k, None, None)
+
+    master_weights = {}
+    slices = defaultdict(list)
+    for unified_key, tensor in unified_master_weights.items():
+        original_key, begin, end = inv_mapping[unified_key]
+        if begin is None:
+            master_weights[original_key] = tensor
+        else:
+            slices[original_key].append((begin, end, tensor))
+    for original_key, pieces in slices.items():
+        numel = max(end for _, end, _ in pieces)
+        flat = paddle.zeros([numel], dtype=pieces[0][2].dtype)
+        for begin, end, tensor in pieces:
+            flat[begin:end] = tensor.flatten()
+        master_weights[original_key] = flat
+    return master_weights
+
+
 class MuonPerParamStagingBuffer:
     """Staging buffer for Muon params that ZCC would otherwise share one-by-one.
 
@@ -283,6 +320,33 @@ def get_fused_param_mappings(
     index = 0
     is_muon = _is_muon_sharding_optimizer(optimizer)
     logger.info(f"[ZCC Manager] Is MuonShardingOptimizer: {is_muon}")
+
+    if _get_fsdp_context() is not None:
+        staging = MuonPerParamStagingBuffer()
+        dtype_to_buffer_index = {}
+        for k, v in manipulated_state_dict.items():
+            if v.dtype not in dtype_to_buffer_index:
+                dtype_to_buffer_index[v.dtype] = str(index)
+                index += 1
+            start, end = staging.reserve(v)
+            param_mappings[k] = {
+                "buffer_index": dtype_to_buffer_index[v.dtype],
+                "shape": list(v.shape),
+                "name": v.name,
+                "start": start,
+                "end": end,
+            }
+        if dtype_to_buffer_index:
+            staging.build()
+            for dtype, buffer_index in dtype_to_buffer_index.items():
+                ipc_meta_mappings[buffer_index] = staging.ipc_meta(dtype)
+            if staging_holder is not None:
+                staging_holder.append(staging)
+        logger.info(
+            f"[ZCC-FSDP] export meta ACTIVE: staged {len(param_mappings)} model states into "
+            f"{len(dtype_to_buffer_index)} buffer(s): { {str(d): n for d, n in staging.numels.items()} } elements"
+        )
+        return param_mappings, ipc_meta_mappings
 
     sharding_comm_buffers = optimizer._comm_buffer_list
     for buffer in sharding_comm_buffers:
@@ -2213,15 +2277,16 @@ class ZeroCostCheckpointWorker:
         # New FC format: flat dict with .w_0 suffix keys being master_weights,
         # other keys are model_params.
         # Need to: 1) rename unified -> static  2) re-pad master_weights to buffer slot size
-        inv_mapping = {v: k for k, v in self.unified_name_mapping.items()}
-        master_weights = {}
+        unified_master_weights = {}
         model_params = {}
         for k, v in state_dict.items():
             if k.endswith(".w_0"):
-                original_key = inv_mapping[k]
-                master_weights[original_key] = v
+                unified_master_weights[k] = v
             else:
                 model_params[k] = v
+        master_weights = _restore_master_weights_from_unified(
+            self.unified_name_mapping, unified_master_weights
+        )
 
         # Re-pad master_weights to match current buffer slot size
         mw_meta = self.optimizer_fusion_storage_helper.master_weights_meta
@@ -2871,7 +2936,7 @@ class DistInfoCollectorValidator:
         if not self.args.use_hybrid_parallel:
             return None
 
-        if not self.args.should_save_sharding_stage1_model:
+        if not self.args.zcc_supported_sharding:
             return None
 
         nranks = dist.get_world_size()
@@ -2880,6 +2945,8 @@ class DistInfoCollectorValidator:
 
         model_meta = {}
         model_meta["parallel_config"] = self._get_distributed_strategy()
+        if self.args.zcc_fsdp_mode:
+            return model_meta
         model_meta["sharding_metas"] = self._gather_sharding_metas(
             model, optimizer
         )
@@ -3081,6 +3148,7 @@ class ZeroCostCheckpointCallbackFcBased(ZeroCostCheckpointCallback):
         self.model_meta = None
         self.zcc_ema_interval = args.zcc_ema_interval
         self.args = args
+        self.muon_param_staging = None
 
         if (
             paddle.distributed.get_world_size() > 1
@@ -3192,7 +3260,11 @@ class ZeroCostCheckpointCallbackFcBased(ZeroCostCheckpointCallback):
     def _cache_meta_for_sharded_save(self, model, optimizer):
         logger.info("Start caching metas for sharded save...")
 
-        if _is_muon_sharding_optimizer(optimizer):
+        if _get_fsdp_context() is not None:
+            self.manipulated_state_dict = dict(
+                sorted(model.sharded_state_dict().items())
+            )
+        elif _is_muon_sharding_optimizer(optimizer):
             self.manipulated_state_dict = (
                 self._muon_manipulate_sharded_state_dict(model, optimizer)
             )
@@ -3323,7 +3395,60 @@ class ZeroCostCheckpointCallbackFcBased(ZeroCostCheckpointCallback):
         )
         logger.info("Cache distributed model meta done.")
 
+    def _gen_unified_name_fsdp(self, fsdp_ctx, optimizer):
+        """FSDP: optimizer state is stored per fused bucket fuse_params_N; one source var splits into N struct keys.
+
+        Uses fsdp_ctx.optimizer_sharded_state_dict (the authoritative source for sync flex save) to
+        map each output ShardedWeight back to (src_var, begin, end) by data_ptr, yielding
+        {src_name: [(unified_key, begin, end), ...]} for the worker to slice and expand.
+
+        Args:
+            fsdp_ctx: current FSDP context, providing optimizer_sharded_state_dict.
+            optimizer: optimizer instance whose state_dict() (incl. master_weights) provides source vars.
+
+        Returns:
+            (mapping, slice_info): mapping is {src_name: [(unified_key, begin, end), ...]} with
+            begin/end as element offsets; slice_info is always {} (FSDP slices are exact, no padding to trim).
+        """
+        out = fsdp_ctx.optimizer_sharded_state_dict(optimizer)
+        state_dict = dict(optimizer.state_dict())
+        master_weights = state_dict.pop("master_weights", None) or {}
+        state_dict.pop("LR_Scheduler", None)
+        sources = []  # (src_name, base_ptr, numel, elem_size)
+        for name, t in list(state_dict.items()) + list(master_weights.items()):
+            if not isinstance(t, paddle.Tensor) or not t._is_initialized():
+                continue
+            sources.append(
+                (name, t.data_ptr(), int(t._numel()), t.element_size())
+            )
+        mapping = {}
+        for key, sw in out.items():
+            lt = sw.local_tensor
+            ptr = lt.data_ptr()
+            numel = int(lt._numel())
+            hit = None
+            for name, base, n, es in sources:
+                if base <= ptr < base + n * es:
+                    hit = (name, (ptr - base) // es)
+                    break
+            if hit is None:
+                raise RuntimeError(
+                    f"[ZCC-FSDP] cannot locate source of {key} (data_ptr={ptr}) in "
+                    "optimizer.state_dict()/master_weights"
+                )
+            name, begin = hit
+            mapping.setdefault(name, []).append(
+                (key, int(begin), int(begin) + numel)
+            )
+        logger.info(
+            f"[ZCC-FSDP] unified name plan: {len(mapping)} source vars -> {len(out)} keys"
+        )
+        return mapping, {}
+
     def _gen_unified_name(self, optimizer, model_sharded_state_dict):
+        _fsdp_ctx = _get_fsdp_context()
+        if _fsdp_ctx is not None:
+            return self._gen_unified_name_fsdp(_fsdp_ctx, optimizer)
         param_slice_info = {}
         padded_param = set()
 
@@ -3440,6 +3565,16 @@ class ZeroCostCheckpointCallbackFcBased(ZeroCostCheckpointCallback):
 
     def maybe_update_zcc_worker(self, args, model, optimizer, global_step):
         inner_opt = _unwrap_opt_for_fused_states(optimizer)
+        if (
+            _get_fsdp_context() is not None
+            and getattr(inner_opt, "fusion_storage", None) is None
+        ):
+            inner_opt.use_fusion_storage()
+            inner_opt._maybe_refuse()
+            logger.info(
+                f"[ZCC-FSDP] fusion storage enabled on {type(inner_opt).__name__}, "
+                f"version={inner_opt.fused_buffer_version}"
+            )
 
         if inner_opt.fused_buffer_version == self.manager.cache_version:
             self.sync_muon_param_staging()
@@ -3529,6 +3664,10 @@ class ZeroCostCheckpointWorkerFcBased(ZeroCostCheckpointWorker):
                 f"{key} not in {self.unified_name_mapping.keys()}"
             )
             new_key = self.unified_name_mapping[key]
+            if isinstance(new_key, list):
+                for unified_key, begin, end in new_key:
+                    new_state_dict[unified_key] = value._slice(begin, end)
+                continue
             new_state_dict[new_key] = value
         return new_state_dict
 
@@ -3877,9 +4016,7 @@ class ZeroCostCheckpointWorkerFcBased(ZeroCostCheckpointWorker):
 
         logger.info("[ZCC Worker] Loading EMA state from shared memory...")
 
-        inv_name_mapping = {v: k for k, v in self.unified_name_mapping.items()}
-
-        master_weights = {}
+        unified_master_weights = {}
         model_params = {}
 
         for unified_key, info in ema_shared_metas.items():
@@ -3891,11 +4028,14 @@ class ZeroCostCheckpointWorkerFcBased(ZeroCostCheckpointWorker):
 
             if unified_key.endswith(".w_0"):
                 # master_weight key: reverse lookup using .w_0 key directly
-                original_key = inv_name_mapping[unified_key]
-                master_weights[original_key] = tensor
+                unified_master_weights[unified_key] = tensor
             else:
                 # model_params key: map back to original param name
                 model_params[unified_key] = tensor
+
+        master_weights = _restore_master_weights_from_unified(
+            self.unified_name_mapping, unified_master_weights
+        )
 
         # Re-pad master_weights to match current buffer slot size
         # FC reshard produces unpadded tensors, but load_ema_state_dict expects padded buffer slots
