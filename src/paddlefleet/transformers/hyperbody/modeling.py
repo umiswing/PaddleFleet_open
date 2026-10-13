@@ -1155,12 +1155,17 @@ def _build_encoder_view(config: HyperBodyConfig, decoder_hidden: int):
         hyperencoder_attn_backend=enc.hyperencoder_attn_backend,
         hyperencoder_packed_decoder=enc.hyperencoder_packed_decoder,
         tensor_model_parallel_size=config.tensor_model_parallel_size,
-        # ``pad_token_id`` is a global (non-``encoder_``-prefixed) field: forward
-        # the top-level value so the encoder trunk uses the SAME pad id as the
-        # decoder (``_build_decoder_view`` merges it from the top-level config).
-        # ``HyperEncoderProvider.__post_init__`` falls back to 0 only when this is
-        # None, so an unset config keeps the previous behavior.
-        pad_token_id=getattr(config, "pad_token_id", None),
+        # ``pad_token_id``: prefer the encoder-scoped value from
+        # ``encoder_config`` (NOT an llm_meta key, so it survives a plain
+        # assignment); fall back to the top-level value so the encoder trunk
+        # keeps the SAME pad id as the decoder by default.
+        # ``HyperEncoderProvider.__post_init__`` falls back to 0 only when this
+        # is None, so an unset config keeps the previous behavior.
+        pad_token_id=(
+            enc.pad_token_id
+            if getattr(enc, "pad_token_id", None) is not None
+            else getattr(config, "pad_token_id", None)
+        ),
         # ---- shared (non-``encoder_``-prefixed) runtime fields --------------- #
         # Geometry uses the ``encoder_`` prefix, but MoE/parallelism/fusion
         # runtime knobs are GLOBAL and SHARED: the encoder and decoder pools read
@@ -1173,14 +1178,17 @@ def _build_encoder_view(config: HyperBodyConfig, decoder_hidden: int):
         #     off ``config.moe_expert_fusion`` (same global), so the checkpoint
         #     weight layout (fused grouped_gemm vs per-expert) stays consistent
         #     between the two pools.
-        #   * router_aux_loss_coef:   global 0.001 vs base 1e-2 -> 10x aux-loss weight.
+        #   * router_aux_loss_coef: NOT shared -- the decoder runs noaux_tc at
+        #     0.0 while the encoder's softmax/greedy router needs a real aux
+        #     loss, so it comes from ``encoder_config`` (default 0.001). Not
+        #     forwarding at all is wrong too: provider base default is 1e-2.
         #   * expert/context_model_parallel_size: encoder would pin EP/CP=1 even
         #     when the decoder runs EP/CP>1.
         # ``sequence_parallel`` is intentionally NOT forwarded: the provider
         # __post_init__ rejects an explicit value and derives it from tp_size.
         moe_expert_fusion=config.moe_expert_fusion,
         moe_deep_gemm=getattr(config, "moe_deep_gemm", True),
-        router_aux_loss_coef=config.router_aux_loss_coef,
+        router_aux_loss_coef=float(enc.router_aux_loss_coef),
         expert_model_parallel_size=config.expert_model_parallel_size,
         context_parallel_size=config.context_parallel_size,
         moe_shared_expert_overlap=config.moe_shared_expert_overlap,

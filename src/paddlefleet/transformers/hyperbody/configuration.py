@@ -283,6 +283,11 @@ class HyperBodyEncoderConfig(PretrainedConfig):
         hyperencoder_seq_align: int = 128,
         hyperencoder_attn_backend: str = "dp",
         hyperencoder_packed_decoder: bool = False,
+        # Encoder-only MoE aux loss, independent of the global coef (the decoder
+        # runs noaux_tc at 0.0). MUST ride through ``super().__init__``: it is an
+        # llm_meta key, so ``set_expected_keys`` overwrites anything assigned on
+        # ``self`` before super with the meta default (0.0).
+        router_aux_loss_coef: float = 0.001,
         **kwargs,
     ):
         # ---- required (sensitive) ----
@@ -361,7 +366,7 @@ class HyperBodyEncoderConfig(PretrainedConfig):
                 "hyperencoder_packed_decoder=True (the triton PrefixLM core only "
                 "supports a packed decoder layout)."
             )
-        super().__init__(**kwargs)
+        super().__init__(router_aux_loss_coef=router_aux_loss_coef, **kwargs)
 
     def to_diff_dict(self, saving_file=False):
         # REQUIRED-geometry policy: a bare ``HyperBodyEncoderConfig()`` raises, so

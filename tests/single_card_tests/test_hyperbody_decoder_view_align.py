@@ -69,11 +69,12 @@ _ENCODER_GEOMETRY = {
 }
 
 
-def _make_config(decoder_overrides=None, **top_level):
+def _make_config(decoder_overrides=None, encoder_overrides=None, **top_level):
     decoder_config = {**_DECODER_GEOMETRY, **(decoder_overrides or {})}
+    encoder_config = {**_ENCODER_GEOMETRY, **(encoder_overrides or {})}
     return HyperBodyConfig(
         decoder_config=decoder_config,
-        encoder_config={**_ENCODER_GEOMETRY},
+        encoder_config=encoder_config,
         **top_level,
     )
 
@@ -185,6 +186,54 @@ def test_encoder_and_decoder_share_pad_token_id():
     assert enc.pad_token_id == 5, enc.pad_token_id
 
 
+def test_encoder_pad_token_id_encoder_scoped_overrides_top_level():
+    """An ``encoder_config.pad_token_id`` wins over the top-level value.
+
+    The encoder view prefers the encoder-scoped id and falls back to the
+    top-level one only when it is None, so a cross-seam shared id stays the
+    default while per-modality overrides remain possible.
+    """
+    cfg = _make_config(
+        encoder_overrides={"pad_token_id": 9},
+        pad_token_id=5,
+    )
+    dec = _build_decoder_view(cfg)
+    enc = _build_encoder_view(cfg, decoder_hidden=64)
+    assert enc.pad_token_id == 9, enc.pad_token_id
+    assert dec.pad_token_id == 5, dec.pad_token_id
+
+
+def test_encoder_router_aux_loss_coef_independently_configurable():
+    """``encoder_config.router_aux_loss_coef`` drives the encoder view."""
+    cfg = _make_config(encoder_overrides={"router_aux_loss_coef": 0.05})
+    view = _build_encoder_view(cfg, decoder_hidden=64)
+    assert view.router_aux_loss_coef == 0.05, view.router_aux_loss_coef
+
+
+def test_encoder_router_aux_loss_coef_decoupled_from_top_level():
+    """The top-level coef no longer leaks into the encoder view.
+
+    The decoder runs noaux_tc at coef 0.0 while the encoder's softmax/greedy
+    router needs a real aux loss, so the encoder coef must come from
+    ``encoder_config`` -- NOT from the global ``config.router_aux_loss_coef``.
+    If this regresses to the global value the encoder aux loss silently
+    follows the decoder-tuned coef.
+    """
+    cfg = _make_config(
+        encoder_overrides={"router_aux_loss_coef": 0.05},
+        router_aux_loss_coef=0.5,
+    )
+    view = _build_encoder_view(cfg, decoder_hidden=64)
+    assert view.router_aux_loss_coef == 0.05, view.router_aux_loss_coef
+
+
+def test_encoder_router_aux_loss_coef_default_keeps_old_global_default():
+    """Unset encoder coef keeps the old behavior (the old global default)."""
+    cfg = _make_config()
+    view = _build_encoder_view(cfg, decoder_hidden=64)
+    assert view.router_aux_loss_coef == 0.001, view.router_aux_loss_coef
+
+
 if __name__ == "__main__":
     try:
         test_nested_dict_promoted_to_subconfigs()
@@ -196,6 +245,10 @@ if __name__ == "__main__":
         test_encoder_pad_token_id_configurable()
         test_encoder_pad_token_id_defaults_to_zero_when_absent()
         test_encoder_and_decoder_share_pad_token_id()
+        test_encoder_pad_token_id_encoder_scoped_overrides_top_level()
+        test_encoder_router_aux_loss_coef_independently_configurable()
+        test_encoder_router_aux_loss_coef_decoupled_from_top_level()
+        test_encoder_router_aux_loss_coef_default_keeps_old_global_default()
     except AssertionError:
         import traceback
 
