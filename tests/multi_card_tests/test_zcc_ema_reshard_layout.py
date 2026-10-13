@@ -410,7 +410,6 @@ class TestZCCEMAReshardLayout(unittest.TestCase):
             0,
             0,
             0,
-            self.rank,
             0.99,
             -1,
             consumed,
@@ -576,6 +575,7 @@ class TestZCCEMAReshardLayout(unittest.TestCase):
         )
         worker.use_expert_parallel = False
         worker.dp_rank = 0
+        worker.global_rank = self.rank
         worker.zcc_ema_processor = None
 
         with patch(

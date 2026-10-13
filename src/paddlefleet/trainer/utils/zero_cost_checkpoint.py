@@ -20,6 +20,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import queue
 import random
 import re
 import time
@@ -27,6 +28,7 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict
 from dataclasses import replace
 from enum import Enum
+from multiprocessing import shared_memory
 
 import numpy as np
 import paddle
@@ -385,6 +387,45 @@ def pin2cpu_zero_copy_fp32(t):
     return alias
 
 
+_SHM_DIR = "/dev/shm"
+_EMA_SHM_PREFIX = "zcc_ema"
+_EMA_SHM_NAME_RE = re.compile(rf"^{_EMA_SHM_PREFIX}_p(\d+)_r\d+_")
+
+
+def cleanup_ema_shared_memory():
+    try:
+        entries = os.listdir(_SHM_DIR)
+    except OSError as e:
+        logger.warning(
+            f"[ZCC EMA] cannot scan {_SHM_DIR} for stale segments: {e}"
+        )
+        return
+    removed, removed_bytes, alive = 0, 0, 0
+    for entry in entries:
+        match = _EMA_SHM_NAME_RE.match(entry)
+        if match is None:
+            continue
+        if os.path.exists(f"/proc/{match.group(1)}"):
+            alive += 1
+            continue
+        path = os.path.join(_SHM_DIR, entry)
+        try:
+            size = os.path.getsize(path)
+            os.unlink(path)
+        except FileNotFoundError:
+            continue  # another rank got there first
+        except OSError as e:
+            logger.warning(f"[ZCC EMA] cannot remove stale segment {path}: {e}")
+            continue
+        removed += 1
+        removed_bytes += size
+    if removed or alive:
+        logger.info(
+            f"[ZCC EMA] stale shared memory scan: removed {removed} segments "
+            f"({removed_bytes / 2**30:.2f} GiB), kept {alive} owned by live processes"
+        )
+
+
 class ZeroCostCheckpointEMAProcessor:
     """
     生活在 ZCC Worker 里面的 EMA 处理模块.
@@ -396,10 +437,21 @@ class ZeroCostCheckpointEMAProcessor:
         optimizer_fusion_storage_helper,
         param_fusion_storage_helper,
         ema_coef,
+        global_rank,
     ):
         self.optimizer_fusion_storage_helper = optimizer_fusion_storage_helper
         self.param_fusion_storage_helper = param_fusion_storage_helper
         self.ema_coef = None if ema_coef is None else float(ema_coef)
+        self.global_rank = global_rank
+        self._shm_segments = []
+        # HF-export snapshot. The live buffers below stay private to this process; only on
+        # HF-checkpoint steps is a copy taken into these `/dev/shm` buffers for the main
+        # process to read, so it never reads memory `ema_accumulate` is still writing.
+        self.ema_snapshot = None
+        self.ema_snapshot_model_params = {}
+        self.ema_buffer_shm_handle = None
+        self.ema_buffer_model_params_shm_handles = {}
+        cleanup_ema_shared_memory()
         (
             self.ema_buffer,
             self.ema_buffer_model_params,
@@ -449,9 +501,190 @@ class ZeroCostCheckpointEMAProcessor:
             master_max_offset,
         )
 
-    def ema_reset(self):
-        self.ema_buffer = None
-        self.ema_buffer_model_params = None
+    def unlink_shared_memory(self):
+        """
+        Unlink the `/dev/shm` segments backing the EMA buffers.
+        """
+        for segment in self._shm_segments:
+            try:
+                segment.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                logger.warning(
+                    f"[ZCC EMA] failed to unlink shared memory {segment.name}: {e}"
+                )
+        self._shm_segments = []
+        self.ema_snapshot = None
+        self.ema_snapshot_model_params = {}
+        self.ema_buffer_shm_handle = None
+        self.ema_buffer_model_params_shm_handles = {}
+
+    def _alloc_shared_memory(self, key, shape, dtype):
+        """
+        Allocate a zero-filled CPU tensor whose storage *is* a `/dev/shm` segment.
+        """
+
+        def _ema_shm_name(pid, global_rank, key):
+            safe_key = re.sub(r"[^0-9A-Za-z]+", "_", str(key))
+            return f"{_EMA_SHM_PREFIX}_p{pid}_r{global_rank}_{safe_key}"
+
+        def _create_shm_segment(name, nbytes):
+            try:
+                return shared_memory.SharedMemory(
+                    create=True, size=nbytes, name=name
+                )
+            except FileExistsError:
+                # Must precede `except OSError`: FileExistsError *is* an OSError, and
+                # the caller relies on it to unlink the stale segment and retry.
+                raise
+            except OSError as e:
+                raise RuntimeError(
+                    f"[ZCC EMA] could not allocate {nbytes / 2**30:.2f} GiB of shared memory "
+                    f"as {name}; check the size of {_SHM_DIR}: {e}"
+                ) from e
+
+        # numpy has no bfloat16, but paddle reads a uint16-backed buffer as bfloat16, so
+        # the segment is laid out as uint16 and reinterpreted on both sides.
+        np_dtype, itemsize, dtype_name = {
+            paddle.float32: (np.float32, 4, "float32"),
+            paddle.bfloat16: (np.uint16, 2, "bfloat16"),
+        }[dtype]
+        shape = [int(d) for d in shape]
+        numel = int(np.prod(shape)) if shape else 1
+        nbytes = max(numel * itemsize, 1)
+        name = _ema_shm_name(os.getpid(), self.global_rank, key)
+        try:
+            segment = _create_shm_segment(name, nbytes)
+        except FileExistsError:
+            logger.warning(
+                f"[ZCC EMA] reclaiming leftover shared memory {name} from a dead predecessor "
+                f"that shared this pid"
+            )
+            try:
+                os.unlink(os.path.join(_SHM_DIR, name))
+            except FileNotFoundError:
+                pass
+            segment = _create_shm_segment(name, nbytes)
+        self._shm_segments.append(segment)
+        array = np.ndarray(tuple(shape), dtype=np_dtype, buffer=segment.buf)
+        array.fill(0)
+        tensor = core.eager.Tensor(
+            value=array, place=core.CPUPlace(), zero_copy=True
+        )
+        tensor._keep_alive = (segment, array)
+        handle = {"name": segment.name, "shape": shape, "dtype": dtype_name}
+        if key == "master":
+            self.ema_buffer_shm_handle = handle
+        else:
+            self.ema_buffer_model_params_shm_handles[key] = handle
+        return tensor
+
+    def _ensure_ema_snapshot(self):
+        """
+        Allocate the `/dev/shm` snapshot buffers, mirroring the live EMA buffers' shapes.
+
+        float32 keeps the exported weights bit-identical and costs only a memcpy. When
+        `/dev/shm` cannot hold the master, degrade *it* to bfloat16: half the bytes, and
+        still exact for the export, which casts master weights to bfloat16 anyway
+        (`recover_params_from_master_weight`). bfloat16 rather than float16 because it keeps
+        float32's exponent range -- float16 flushes small EMA values to zero and overflows
+        large ones.
+
+        The float32 model-weight EMAs (moe gates) are never degraded: they are exported with
+        their own dtype, and they are tiny next to the master buffer.
+        """
+        if self.ema_snapshot is not None:
+            return
+        for master_dtype in (paddle.float32, paddle.bfloat16):
+            try:
+                with device_guard("cpu"):
+                    snapshot = self._alloc_shared_memory(
+                        "master", self.ema_buffer.shape, master_dtype
+                    )
+                    snapshot_params = {
+                        k: self._alloc_shared_memory(k, v.shape, paddle.float32)
+                        for k, v in self.ema_buffer_model_params.items()
+                    }
+            except (RuntimeError, OSError) as e:
+                self.unlink_shared_memory()
+                if master_dtype is paddle.bfloat16:
+                    raise
+                logger.warning(
+                    f"[ZCC EMA] the float32 EMA snapshot does not fit in {_SHM_DIR} ({e}); "
+                    "degrading the master snapshot to bfloat16"
+                )
+                continue
+            self.ema_snapshot = snapshot
+            self.ema_snapshot_model_params = snapshot_params
+            nbytes = sum(segment.size for segment in self._shm_segments)
+            logger.info(
+                f"[ZCC EMA] EMA snapshot buffers ready: master {master_dtype}, "
+                f"{nbytes / 2**30:.2f} GiB in {_SHM_DIR}"
+            )
+            return
+
+    @imperative_base.no_grad()
+    def take_ema_snapshot(self):
+        """
+        Copy the live EMA into the shared snapshot that the main process reads.
+
+        Runs inside the worker, sequentially with `ema_accumulate`, so the snapshot always
+        holds one complete step: the main process can never observe a half-written copy,
+        and the live buffers keep accumulating untouched.
+        """
+        self._ensure_ema_snapshot()
+        with device_guard("cpu"):
+            pairs = [(self.ema_buffer, self.ema_snapshot)] + [
+                (self.ema_buffer_model_params[k], dst)
+                for k, dst in self.ema_snapshot_model_params.items()
+            ]
+            for src, dst in pairs:
+                paddle.assign(
+                    src if src.dtype == dst.dtype else src.astype(dst.dtype),
+                    dst,
+                )
+
+    def shm_package(self):
+        """
+        Describe the snapshot buffers so the main process can rebuild tensors from them.
+
+        Offsets are rebased onto `ema_buffer`, which only spans
+        `[master_min_offset, master_max_offset)` of the optimizer's master weights.
+        """
+        assert self.ema_buffer_shm_handle is not None, (
+            "[ZCC EMA] ema snapshot buffers were not allocated"
+        )
+        master_weights = {}
+        master_metas = self.optimizer_fusion_storage_helper.master_weights_meta
+        for k, meta in master_metas.items():
+            master_weights[k] = {
+                "start": meta["start"] - self.master_min_offset,
+                "end": meta["end"] - self.master_min_offset,
+                "shape": list(meta["shape"]),
+                "name": meta["name"],
+            }
+        metas = {}
+        param_metas = self.param_fusion_storage_helper.model_weights_metas
+        for k, meta in param_metas.items():
+            buffer_index = meta["buffer_index"]
+            if buffer_index not in self.ema_buffer_model_params:
+                continue  # non fp32 has no `ema_buffer_model_params`
+            metas[k] = {
+                "buffer_index": buffer_index,
+                # `unshard_` type tensors use the entire buffer directly
+                "whole_buffer": buffer_index.startswith("unshard_"),
+                "start": meta.get("start"),
+                "end": meta.get("end"),
+                "shape": list(meta["shape"]),
+                "name": meta["name"],
+            }
+        metas["master_weights"] = master_weights
+        return {
+            "master_shm": self.ema_buffer_shm_handle,
+            "param_shm": dict(self.ema_buffer_model_params_shm_handles),
+            "metas": metas,
+        }
 
     @imperative_base.no_grad()
     def ema_accumulate(self, global_step, loss, zcc_ema_loss_threshold):
@@ -485,10 +718,7 @@ class ZeroCostCheckpointEMAProcessor:
                     _, cpu_buf = (
                         self.param_fusion_storage_helper.inited_buffers[index]
                     )
-                    updated_ema = (
-                        self.ema_coef * ema_buf + (1 - self.ema_coef) * cpu_buf
-                    )
-                    self.ema_buffer_model_params[index] = updated_ema
+                    ema_buf.lerp_(cpu_buf, 1 - self.ema_coef)
                 logger.info(
                     f"[ZCC EMA] accmulating, buffer type:{self.ema_buffer.place} {self.ema_buffer.dtype}, done"
                 )
@@ -1103,7 +1333,6 @@ class ZeroCostCheckpointManager:
             "capacity_usage must be less than or equal to 1.0"
         )
         self.cache_version = 0
-        self.worker_num = worker_num
         self.workers = []
         self.processes = []
         self.current_worker = None
@@ -1127,12 +1356,21 @@ class ZeroCostCheckpointManager:
         )
         if zcc_worker_class is None:
             zcc_worker_class = ZeroCostCheckpointWorker
+        ema_shm_enabled = ema_coef is not None and save_hf_steps > 0
         for i in range(worker_num):
             worker_task_queue = ctx.Queue()
             worker_status = ctx.Value("i", ZCCWorkerStatus.IDLE.value)
             worker_version = ctx.Value("i", 0)
             worker_step = ctx.Value("i", 0)
             ema_shm_consumed = ctx.Event()
+            if ema_shm_enabled:
+                ema_ready_step = ctx.Value("i", -1)
+                ema_meta_queue = ctx.Queue()
+                ema_shm_generation = ctx.Value("i", 0)
+            else:
+                ema_ready_step = None
+                ema_meta_queue = None
+                ema_shm_generation = None
             worker = zcc_worker_class(
                 i,
                 self.device_id,
@@ -1146,10 +1384,12 @@ class ZeroCostCheckpointManager:
                 fleet.get_hybrid_communicate_group().get_data_parallel_rank(),
                 fleet.get_hybrid_communicate_group().get_model_parallel_rank(),
                 fleet.get_hybrid_communicate_group()._get_pipe_parallel_id(),
-                fleet.get_hybrid_communicate_group().get_sharding_parallel_rank(),
                 ema_coef,
                 save_hf_steps,
                 ema_shm_consumed,
+                ema_ready_step,
+                ema_meta_queue,
+                ema_shm_generation,
             )
             p = ctx.Process(target=worker_loop, args=(worker,))
             p.start()
@@ -1159,7 +1399,40 @@ class ZeroCostCheckpointManager:
         self.ema_shared_metas = None
         self._ema_tensor_refs = None
         self._ema_shm_release_pending = False
+        self._ema_shm_package = None
+        self._ema_shm_generation_seen = 0
         atexit.register(self.terminate_workers)
+
+    def ema_shared_memory_ready_step(self):
+        """Latest step whose EMA values are readable from the workers' shared memory."""
+        steps = [
+            worker.ema_ready_step.value
+            for worker in self.workers
+            if worker.ema_ready_step is not None
+        ]
+        if not steps:
+            return -1
+        return min(steps)
+
+    def get_ema_package(self, timeout=600):
+        for worker in self.workers:
+            if worker.ema_meta_queue is None:
+                continue
+            while (
+                worker.ema_shm_generation.value > self._ema_shm_generation_seen
+            ):
+                try:
+                    self._ema_shm_package = worker.ema_meta_queue.get(
+                        timeout=timeout
+                    )
+                except queue.Empty:
+                    raise RuntimeError(
+                        "[ZCC manager] timed out waiting for the EMA shared memory package "
+                        f"(generation {worker.ema_shm_generation.value}, "
+                        f"seen {self._ema_shm_generation_seen})"
+                    )
+                self._ema_shm_generation_seen += 1
+        return self._ema_shm_package
 
     def set_ema_state_dict(self, path):
         logger.info(f"[ZCC manager] setting EMA state dict: {path}")
@@ -1187,7 +1460,11 @@ class ZeroCostCheckpointManager:
     @staticmethod
     def _check_shm_files_released(shm_filenames):
         """Check if specific shm files have been released (deleted from /dev/shm)."""
-        leaked = [f for f in shm_filenames if os.path.exists(f)]
+        leaked = [
+            f
+            for f in shm_filenames
+            if os.path.exists(os.path.join("/dev/shm", str(f).lstrip("/")))
+        ]
         return leaked
 
     def update_zcc_workers(
@@ -1403,10 +1680,12 @@ class ZeroCostCheckpointWorker:
         dp_rank,
         mp_rank,
         pp_rank,
-        sd_rank,
         ema_coef=None,
         save_hf_steps=-1,
         ema_shm_consumed=None,
+        ema_ready_step=None,
+        ema_meta_queue=None,
+        ema_shm_generation=None,
     ):
         super().__init__()
         self.worker_id = worker_id
@@ -1422,9 +1701,11 @@ class ZeroCostCheckpointWorker:
         self.dp_rank = dp_rank
         self.mp_rank = mp_rank
         self.pp_rank = pp_rank
-        self.sd_rank = sd_rank
         self.save_hf_steps = save_hf_steps
         self.ema_shm_consumed = ema_shm_consumed
+        self.ema_ready_step = ema_ready_step
+        self.ema_meta_queue = ema_meta_queue
+        self.ema_shm_generation = ema_shm_generation
 
         # for dynamic objects saving
         self.optimizer_fusion_storage_helper = None
@@ -1454,6 +1735,7 @@ class ZeroCostCheckpointWorker:
         self.pending_ema_ckpt_path = None
         self.pending_ema_shared_metas = None
         self.pending_ema_rebuild = False
+        self.pending_ema_package = False
 
     def process_update_task(self, updates):
         """
@@ -1548,6 +1830,7 @@ class ZeroCostCheckpointWorker:
                     self.trainer_state.loss,
                     self.training_args_content.zcc_ema_loss_threshold,
                 )
+                self._mark_ema_ready(global_step)
 
         # continue to process dumping task at the last chunk
         if self.offloaded_numels == self.all_numel:
@@ -1564,14 +1847,52 @@ class ZeroCostCheckpointWorker:
             return True
         return False
 
+    def _mark_ema_ready(self, global_step):
+        """
+        Snapshot the EMA into shared memory and mark `global_step` readable by the main
+        process.
+
+        Only HF-checkpoint steps are snapshotted: every other step's EMA is never
+        exported, so copying it would be wasted work.
+        """
+        if self.ema_ready_step is None:
+            return
+        if self.save_hf_steps <= 0 or global_step % self.save_hf_steps != 0:
+            return
+
+        self.zcc_ema_processor.take_ema_snapshot()
+
+        if self.pending_ema_package and self.ema_meta_queue is not None:
+            package = self.zcc_ema_processor.shm_package()
+            if self.use_expert_parallel and self.dp_rank > 0:
+                # Mirror the key filtering the file dump applies for expert parallel.
+                package["metas"] = self._filter_moe_no_sync_optimizer_params(
+                    self.model_meta_content, package["metas"]
+                )
+            self.ema_meta_queue.put(package)
+            # Bump the generation only after the put, so a main process that observes the new
+            # generation can block on `get()` and be sure the item is on its way.
+            self.ema_shm_generation.value += 1
+            self.pending_ema_package = False
+            entries = len(package["metas"])
+            logger.info(
+                f"[ZCC EMA] sent shared memory package "
+                f"(generation {self.ema_shm_generation.value}) with {entries} entries"
+            )
+        self.ema_ready_step.value = global_step
+
     def _maybe_prepare_ema(self):
         if self.pending_ema_rebuild:
+            if self.zcc_ema_processor is not None:
+                self.zcc_ema_processor.unlink_shared_memory()
             self.zcc_ema_processor = ZeroCostCheckpointEMAProcessor(
                 self.optimizer_fusion_storage_helper,
                 self.param_fusion_storage_helper,
                 self.ema_coef,
+                global_rank=self.global_rank,
             )
             self.pending_ema_rebuild = False
+            self.pending_ema_package = True
         # Path A: main process completed EMA reshard, pass via shared memory
         if self.pending_ema_shared_metas is not None:
             with device_guard("cpu"):
@@ -1608,9 +1929,7 @@ class ZeroCostCheckpointWorker:
         need_report_error = False
         if self.flash_device_save_dir:
             try:
-                self.process_dump_task_impl(
-                    self.flash_device_save_dir, saved_signal_type="formal"
-                )
+                self.process_dump_task_impl(self.flash_device_save_dir)
                 logger.info(
                     f"[ZCC Worker{self.worker_id}] Dumping to flash device done: {self.flash_device_save_dir}"
                 )
@@ -1742,13 +2061,7 @@ class ZeroCostCheckpointWorker:
             )
             paddle.save(self.rng_state, rng_state_name_path)
 
-    def process_dump_task_impl(self, output_dir, saved_signal_type="tmp"):
-        assert saved_signal_type in [
-            "tmp",
-            "formal",
-        ], (
-            f"saved_signal_type must be one of ['tmp', 'formal'], but got {saved_signal_type}"
-        )
+    def process_dump_task_impl(self, output_dir):
         os.makedirs(output_dir, exist_ok=True)
         # Step1: save static objects
         if self.device_id == 0:
@@ -1761,27 +2074,11 @@ class ZeroCostCheckpointWorker:
 
         self._dump_args_and_state(output_dir)
 
-        is_hf_step = (
-            self.save_hf_steps > 0
-            and self.global_step.value % self.save_hf_steps == 0
-        )
-        if (
-            is_hf_step
-            and self.ema_coef is not None
-            and saved_signal_type == "tmp"
-        ):
-            saved_signal_prefix = "save_signal_TMP"
-        else:
-            saved_signal_prefix = "saved_signal"
-
         # Step3: dump save signals
         saved_signal_path = os.path.join(
-            output_dir, f"{saved_signal_prefix}_{self.global_rank}"
-        )
-        potential_signal_path = os.path.join(
             output_dir, f"saved_signal_{self.global_rank}"
         )
-        if os.path.exists(potential_signal_path):
+        if os.path.exists(saved_signal_path):
             logger.info("[ZCC worker] dump save signal done.")
             return
 
