@@ -229,6 +229,14 @@ class GPTEmbedding(FleetLayer):
         """
         visual_pos_masks = None
         deepstack_visual_embeds = None
+        # Optional zero-valued scalar from an upstream encoder that had nothing to
+        # merge this micro-batch (HyperBody text-only path). Adding it keeps the
+        # encoder in the backward graph without changing any value.
+        keepalive = dict_args.get("multimodal_keepalive", None)
+        if keepalive is not None:
+            decoder_input = decoder_input + keepalive.astype(
+                decoder_input.dtype
+            )
         image_embeds = dict_args.get("image_embeds", None)
         video_embeds = dict_args.get("video_embeds", None)
         image_mask = None

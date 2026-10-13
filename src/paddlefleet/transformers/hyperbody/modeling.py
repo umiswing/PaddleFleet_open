@@ -460,9 +460,18 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
         through. The bridge drops the dummy (image_embeds=None) under the
         ``_hb_text_only`` flag, so the decoder runs on pure text.
         """
-        H = int(self.query_short.weight.shape[-1])
         dtype = self.query_short.weight.dtype
-        dummy_ctx = paddle.zeros([1, 1, H], dtype=dtype)
+        # Build the 1-token dummy through the real context builder (embed_tokens +
+        # zero-weighted image/audio tower + projector keepalive) and zero it, so a
+        # text-only rank touches the same parameters as a multimodal rank. Together
+        # with the bridge's ``multimodal_keepalive`` this keeps the encoder in the
+        # backward graph: every EP rank then issues the same DeepEP dispatch/combine
+        # sequence even when only some ranks got a text-only micro-batch (e.g. an
+        # image read failure degraded one sample). Values stay exactly zero.
+        ctx = self._embed_one_context(
+            paddle.zeros([1], dtype="int64"), None, None
+        )
+        dummy_ctx = (ctx * 0.0).astype(dtype).unsqueeze(0)  # [1, 1, H]
         if self.packed:
             out = self._forward_packed(dummy_ctx, False)
         else:
@@ -626,6 +635,24 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
         }
 
 
+class _ZeroGradKeepalive(paddle.autograd.PyLayer):
+    """Zeros forward, zeros backward.
+
+    Keeps the encoder in a text-only rank's backward graph so every EP rank
+    issues the same DeepEP dispatch/combine calls (no deadlock), while carrying
+    an exact zero so no gradient changes. Unlike ``x * 0.0``, the output does not
+    depend on ``x``, so a non-finite encoder output cannot leak into the decoder.
+    """
+
+    @staticmethod
+    def forward(ctx, x):
+        return paddle.zeros_like(x)
+
+    @staticmethod
+    def backward(ctx, dy):
+        return paddle.zeros_like(dy)
+
+
 # ======================================================================= #
 # NEW wrapper layer 2: bridge (encoder trunk output -> decoder latents)    #
 # ======================================================================= #
@@ -672,10 +699,23 @@ class HyperBodyEncoderBridge(FleetLayer):
 
     def forward(self, dict_args):
         # Text-only short path: encoder produced a discardable dummy; emit
-        # image_embeds=None so the decoder embedding's _merge_multimodal no-ops.
+        # image_embeds=None so the decoder embedding's _merge_multimodal skips the
+        # scatter. The dummy is still projected and handed over as a zero-valued
+        # ``multimodal_keepalive`` scalar that the decoder embedding adds to its
+        # input, so the encoder trunk (and its EP collectives) runs backward on
+        # every rank, keeping DeepEP call counts symmetric across the EP group.
+        # The scalar goes through ``_ZeroGradKeepalive``: the backward edge reaches
+        # the encoder (DeepEP call counts stay aligned) but carries an exact 0.
         if dict_args.get("_hb_text_only", False):
+            layout = dict_args.get("_hb_packed", None)
+            if layout is not None:
+                dummy = self._forward_packed(dict_args, layout)
+            else:
+                dummy = self._forward_dense(dict_args)
+            keepalive = _ZeroGradKeepalive.apply(dummy).sum()
             return _restore_decoder_passthrough(
                 {
+                    "multimodal_keepalive": keepalive,
                     "input_ids": dict_args["_hb_dec_input_ids"],
                     "position_ids": dict_args.get("_hb_dec_position_ids", None),
                     "attention_mask": None,
@@ -1146,6 +1186,10 @@ def _build_encoder_view(config: HyperBodyConfig, decoder_hidden: int):
         moe_shared_expert_overlap=config.moe_shared_expert_overlap,
         moe_router_load_balancing_type=config.moe_router_load_balancing_type,
         moe_token_dispatcher_type=config.moe_token_dispatcher_type,
+        # fake gate (random router logits) must match the decoder for perf tests
+        moe_router_force_load_balancing=getattr(
+            config, "moe_router_force_load_balancing", False
+        ),
         apply_rope_fusion=False,
         # Mirror the decoder's routed-scaling learnability: when the flat config
         # turns it on, the decoder's moe_router allocates a learnable

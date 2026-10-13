@@ -1200,8 +1200,11 @@ class PretrainedConfig:
         self.kto_config = kwargs.pop("kto_config", None)
 
         self.use_unified_moe = kwargs.pop("use_unified_moe", False)
+        # set_expected_keys() above already consumed this llm_meta key from kwargs;
+        # fall back to that value instead of resetting it to False.
         self.moe_router_force_load_balancing = kwargs.pop(
-            "moe_router_force_load_balancing", False
+            "moe_router_force_load_balancing",
+            getattr(self, "moe_router_force_load_balancing", False),
         )
 
         # Tokenizer arguments TODO: eventually tokenizer and models should share the same config
