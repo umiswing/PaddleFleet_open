@@ -117,7 +117,7 @@ class TestPackageInfo(unittest.TestCase):
     def test_version_assembled_from_version_txt_and_commit(self):
         # Decompose the assembled __version__ and check each component against
         # an INDEPENDENT source, never re-deriving it from the production code:
-        #   * base version -> the raw version.txt input (currently "0.5.0").
+        #   * base version -> the raw version.txt input (currently "0.6.0").
         #   * When built in CI a generated _version.py is present and the string
         #     is ``f"{base}.{dev|post}{YYYYMMDD}+{commit_short}"`` where the date
         #     is HEAD's own commit date and commit_short is the 11-char prefix
@@ -127,7 +127,7 @@ class TestPackageInfo(unittest.TestCase):
         # A wrong separator, wrong/absent date, dropped base version, or a
         # short SHA that is not a prefix of the exported commit all fail here.
         base = _read_version_txt()
-        self.assertEqual(base, "0.5.0")  # pin the known current base version
+        self.assertEqual(base, "0.6.0")  # pin the known current base version
         version = _pi.__version__
 
         if "+" in version:
